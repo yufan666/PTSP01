@@ -102,27 +102,45 @@ jobs:
                 target/linux/ath79/dts/ar9331_8dev_carambola2.dts
 
           echo "===== 2/4 内核：打开 /dev/mem ====="
-          KCFG=$(ls target/linux/ath79/config-[0-9]* 2>/dev/null | sort -V | tail -1)
-          GENC=$(ls target/linux/generic/config-[0-9]* 2>/dev/null | sort -V | tail -1)
-          if [ -z "$KCFG" ] || [ -z "$GENC" ]; then
-            echo "!! 找不到内核 config"; ls target/linux; exit 1
-          fi
-          echo "  target : $KCFG"
-          echo "  generic: $GENC"
+          # 直接从 ath79 的 Makefile 读内核版本号，避免 ls|sort 猜错文件
+          KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/ath79/Makefile | tr -d ' \t')
+          GENC="target/linux/generic/config-$KVER"
+          KCFG="target/linux/ath79/config-$KVER"
+          SUBCFG=$(ls target/linux/ath79/*/config-default 2>/dev/null || true)
+          for f in "$GENC" "$KCFG"; do
+            [ -f "$f" ] || { echo "!! 缺少 $f"; exit 1; }
+          done
+          echo "  内核版本 : $KVER"
+          echo "  generic  : $GENC"
+          echo "  target   : $KCFG"
+          echo "  subtarget: ${SUBCFG:-(无)}"
 
-          # OpenWrt 在 generic 里显式写了 "# CONFIG_DEVMEM is not set"，先翻过来
-          sed -i 's/^# CONFIG_DEVMEM is not set$/CONFIG_DEVMEM=y/' "$GENC"
+          # 背景：OpenWrt 用 kconfig.pl 依序合并 generic -> target -> subtarget
+          # 三份 config，后者覆盖前者；而对同一文件内的重复条目是「后出现的赢」。
+          # 上一版只 sed generic + 追加 target，结果 DEVMEM 仍是 n —— 说明顺序
+          # 假设不可靠。这里干脆三份文件全部写入，且每份都写在文件末尾，
+          # 无论 merge 顺序如何，结果都必然是 y。
+          DEVMEM_BLOCK=$(cat ../config/kernel-extra.config)
 
-          # IO_STRICT_DEVMEM=y 会让 /dev/mem 拒绝访问任何已被 request_mem_region
-          # 登记的 I/O 区域。0x1f000000 正被 spi@1f000000 占着 ——
-          # 不关掉这一项，DEVMEM 开了也 mmap 不到 SPI 寄存器。
-          sed -i 's/^CONFIG_IO_STRICT_DEVMEM=y$/# CONFIG_IO_STRICT_DEVMEM is not set/' "$GENC"
+          # 坑 1：generic 里显式写了 "# CONFIG_DEVMEM is not set"，翻成 y
+          # 坑 2：IO_STRICT_DEVMEM=y 会拦掉已被驱动登记的 I/O 区域，关掉
+          # （正则容忍行尾空白/CR，避免匹配失败后静默无效）
+          sed -i -E 's/^[[:space:]]*#[[:space:]]*CONFIG_DEVMEM[[:space:]]+is not set[[:space:]]*$/CONFIG_DEVMEM=y/' "$GENC"
+          sed -i -E 's/^CONFIG_IO_STRICT_DEVMEM=y[[:space:]]*$/# CONFIG_IO_STRICT_DEVMEM is not set/' "$GENC"
 
-          # target 层再兜一次（合并时 target 覆盖 generic）
-          cat ../config/kernel-extra.config >> "$KCFG"
+          # 三份 config 末尾全部追加（文件内后者胜出）
+          MARK='# ==== PTSP01: /dev/mem for PL7223 bitbang ===='
+          printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$GENC"
+          printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$KCFG"
+          [ -n "$SUBCFG" ] && printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$SUBCFG"
 
           echo "  --- 处理后 ---"
-          grep -n 'DEVMEM' "$GENC" "$KCFG" || true
+          grep -n 'DEVMEM' "$GENC" "$KCFG" $SUBCFG || true
+
+          # 自检：写不进去就当场报错，不要白跑 40 分钟
+          grep -q '^CONFIG_DEVMEM=y$' "$GENC" || { echo "!! generic 未写入 DEVMEM=y"; exit 1; }
+          grep -q '^CONFIG_DEVMEM=y$' "$KCFG" || { echo "!! target 未写入 DEVMEM=y"; exit 1; }
+          echo "  ✓ DEVMEM=y 已写入 generic + target（$( [ -n "$SUBCFG" ] && echo '+ subtarget' )）"
 
           echo "===== 3/4 打包进镜像的文件 ====="
           mkdir -p files
