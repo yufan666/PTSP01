@@ -106,21 +106,20 @@ jobs:
           KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/ath79/Makefile | tr -d ' \t')
           GENC="target/linux/generic/config-$KVER"
           KCFG="target/linux/ath79/config-$KVER"
-          SUBCFG=$(ls target/linux/ath79/*/config-default 2>/dev/null || true)
           for f in "$GENC" "$KCFG"; do
             [ -f "$f" ] || { echo "!! 缺少 $f"; exit 1; }
           done
           echo "  内核版本 : $KVER"
           echo "  generic  : $GENC"
           echo "  target   : $KCFG"
-          echo "  subtarget: ${SUBCFG:-(无)}"
 
           # 背景：OpenWrt 用 kconfig.pl 依序合并 generic -> target -> subtarget
           # 三份 config，后者覆盖前者；而对同一文件内的重复条目是「后出现的赢」。
           # 上一版只 sed generic + 追加 target，结果 DEVMEM 仍是 n —— 说明顺序
-          # 假设不可靠。这里干脆三份文件全部写入，且每份都写在文件末尾，
-          # 无论 merge 顺序如何，结果都必然是 y。
+          # 假设不可靠。这里把 generic、target、以及全部子目标 config-default
+          # 的末尾都写入，无论 merge 顺序如何，结果都必然是 y。
           DEVMEM_BLOCK=$(cat ../config/kernel-extra.config)
+          MARK='# ==== PTSP01: /dev/mem for PL7223 bitbang ===='
 
           # 坑 1：generic 里显式写了 "# CONFIG_DEVMEM is not set"，翻成 y
           # 坑 2：IO_STRICT_DEVMEM=y 会拦掉已被驱动登记的 I/O 区域，关掉
@@ -128,19 +127,21 @@ jobs:
           sed -i -E 's/^[[:space:]]*#[[:space:]]*CONFIG_DEVMEM[[:space:]]+is not set[[:space:]]*$/CONFIG_DEVMEM=y/' "$GENC"
           sed -i -E 's/^CONFIG_IO_STRICT_DEVMEM=y[[:space:]]*$/# CONFIG_IO_STRICT_DEVMEM is not set/' "$GENC"
 
-          # 三份 config 末尾全部追加（文件内后者胜出）
-          MARK='# ==== PTSP01: /dev/mem for PL7223 bitbang ===='
           printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$GENC"
           printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$KCFG"
-          [ -n "$SUBCFG" ] && printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$SUBCFG"
+          for sf in target/linux/ath79/*/config-default; do
+            [ -f "$sf" ] || continue
+            printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$sf"
+            echo "  已追加: $sf"
+          done
 
           echo "  --- 处理后 ---"
-          grep -n 'DEVMEM' "$GENC" "$KCFG" $SUBCFG || true
+          grep -n 'DEVMEM' "$GENC" "$KCFG" target/linux/ath79/*/config-default || true
 
           # 自检：写不进去就当场报错，不要白跑 40 分钟
           grep -q '^CONFIG_DEVMEM=y$' "$GENC" || { echo "!! generic 未写入 DEVMEM=y"; exit 1; }
           grep -q '^CONFIG_DEVMEM=y$' "$KCFG" || { echo "!! target 未写入 DEVMEM=y"; exit 1; }
-          echo "  ✓ DEVMEM=y 已写入 generic + target（$( [ -n "$SUBCFG" ] && echo '+ subtarget' )）"
+          echo "  ✓ DEVMEM=y 已写入 generic + target + 全部 subtarget"
 
           echo "===== 3/4 打包进镜像的文件 ====="
           mkdir -p files
