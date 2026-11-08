@@ -173,26 +173,6 @@ jobs:
           fi
           echo "构建完成"
 
-      - name: Verify kernel config actually took effect
-        run: |
-          cd openwrt
-          KCFG=$(find build_dir -maxdepth 5 -name '.config' -path '*linux-*' | head -n 1)
-          if [ -z "$KCFG" ]; then
-            echo "!! 找不到内核 .config，无法确认"; exit 1
-          fi
-          echo "内核 .config: $KCFG"
-          grep -E 'DEVMEM' "$KCFG" || true
-          if grep -q '^CONFIG_DEVMEM=y$' "$KCFG"; then
-            echo "✓ CONFIG_DEVMEM 已生效"
-          else
-            echo "✗ CONFIG_DEVMEM 没进内核，/dev/mem 方案会失效"; exit 1
-          fi
-          if grep -q '^CONFIG_IO_STRICT_DEVMEM=y$' "$KCFG"; then
-            echo "✗ IO_STRICT_DEVMEM 仍然开着，mmap 0x1f000000 会被拒绝"; exit 1
-          else
-            echo "✓ IO_STRICT_DEVMEM 已关闭"
-          fi
-
       - name: Show artifacts
         run: |
           cd openwrt
@@ -210,6 +190,33 @@ jobs:
             openwrt/bin/targets/ath79/generic/sha256sums
           if-no-files-found: error
           retention-days: 30
+
+      # 固件已上传完成后再做校验：即使这里挂了，artifact 也不会丢
+      - name: Verify kernel config actually took effect
+        run: |
+          cd openwrt
+          # 注意：不能用 -path '*linux-*' —— mac80211 的 backports 源码树里
+          # 也有自己的 .config（build_dir/target-*/mac80211-regular/backports-*/.config），
+          # find 顺序靠前就会抓错文件，误判 DEVMEM 没生效。
+          # 用 *linux-6* 锁定真正的内核构建目录（内核源码树形如 linux-6.12.71）。
+          KCFG=$(find build_dir -maxdepth 5 -path '*linux-6*/.config' | head -n 1)
+          if [ -z "$KCFG" ]; then
+            echo "!! find 没匹配到内核 .config，所有候选如下（用于排查）："
+            find build_dir -maxdepth 5 -name '.config' | head -n 20
+            exit 1
+          fi
+          echo "内核 .config: $KCFG"
+          grep -E 'DEVMEM' "$KCFG" || true
+          if grep -q '^CONFIG_DEVMEM=y$' "$KCFG"; then
+            echo "✓ CONFIG_DEVMEM 已生效"
+          else
+            echo "✗ CONFIG_DEVMEM 没进内核，/dev/mem 方案会失效"; exit 1
+          fi
+          if grep -q '^CONFIG_IO_STRICT_DEVMEM=y$' "$KCFG"; then
+            echo "✗ IO_STRICT_DEVMEM 仍然开着，mmap 0x1f000000 会被拒绝"; exit 1
+          else
+            echo "✓ IO_STRICT_DEVMEM 已关闭"
+          fi
 
       - name: Upload build log on failure
         if: failure()
