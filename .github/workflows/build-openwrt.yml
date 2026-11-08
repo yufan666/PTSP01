@@ -1,0 +1,221 @@
+name: Build OpenWrt for PTSP01
+
+# 云编译 PTSP01 插排（AR9331 / 16MB flash / 64MB RAM）专用 OpenWrt 固件
+#
+# 为什么必须走「源码编译」而不是官方 Image Builder：
+#   Image Builder 用的是预编译内核，改不了内核 config。
+#   而我们需要 CONFIG_DEVMEM —— PL7223 原厂驱动是位带写法（直接读写 SPI 块
+#   的 IOC/RDS 寄存器，125kHz），硬件 SPI 引擎最低只到 1.5625MHz，
+#   只有拿到 /dev/mem 才能在用户态复刻原厂时序。
+#
+# 用法：仓库 → Actions → Build OpenWrt for PTSP01 → Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: 'OpenWrt tag / branch'
+        required: true
+        default: 'v25.12.0'
+        type: string
+      with_luci:
+        description: '打包 LuCI 网页界面（会多花约 25 分钟）'
+        required: true
+        default: false
+        type: boolean
+      extra_packages:
+        description: '额外包，空格分隔（例如 "wpad-mini kmod-usb-storage"）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.openwrt_ref }}
+  cancel-in-progress: false
+
+env:
+  OPENWRT_REF: ${{ inputs.openwrt_ref }}
+  TARGET: ath79
+  SUBTARGET: generic
+  PROFILE: 8dev_carambola2
+
+jobs:
+  build:
+    name: build ath79/generic
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # OpenWrt 全量编译大约要 15~20GB，标准 runner 余量不够，先清一下
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
+            rsync unzip zlib1g-dev file wget ccache
+
+      - name: Clone OpenWrt ${{ inputs.openwrt_ref }}
+        run: |
+          git clone --depth 1 --branch "$OPENWRT_REF" \
+            https://github.com/openwrt/openwrt.git openwrt
+          cd openwrt
+          git log -1 --format='构建基线: %H  %s'
+
+      - name: Restore downloads cache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/dl
+          key: dl-${{ env.TARGET }}-${{ inputs.openwrt_ref }}
+          restore-keys: |
+            dl-${{ env.TARGET }}-
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.TARGET }}-${{ inputs.openwrt_ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.TARGET }}-${{ inputs.openwrt_ref }}-
+            ccache-${{ env.TARGET }}-
+
+      - name: Apply PTSP01 customizations
+        run: |
+          set -euo pipefail
+          cd openwrt
+
+          echo "===== 1/4 设备树 ====="
+          cp -v ../dts/ar9331_8dev_carambola2.dts \
+                target/linux/ath79/dts/ar9331_8dev_carambola2.dts
+
+          echo "===== 2/4 内核：打开 /dev/mem ====="
+          KCFG=$(ls target/linux/ath79/config-[0-9]* 2>/dev/null | sort -V | tail -1)
+          GENC=$(ls target/linux/generic/config-[0-9]* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$KCFG" ] || [ -z "$GENC" ]; then
+            echo "!! 找不到内核 config"; ls target/linux; exit 1
+          fi
+          echo "  target : $KCFG"
+          echo "  generic: $GENC"
+
+          # OpenWrt 在 generic 里显式写了 "# CONFIG_DEVMEM is not set"，先翻过来
+          sed -i 's/^# CONFIG_DEVMEM is not set$/CONFIG_DEVMEM=y/' "$GENC"
+
+          # IO_STRICT_DEVMEM=y 会让 /dev/mem 拒绝访问任何已被 request_mem_region
+          # 登记的 I/O 区域。0x1f000000 正被 spi@1f000000 占着 ——
+          # 不关掉这一项，DEVMEM 开了也 mmap 不到 SPI 寄存器。
+          sed -i 's/^CONFIG_IO_STRICT_DEVMEM=y$/# CONFIG_IO_STRICT_DEVMEM is not set/' "$GENC"
+
+          # target 层再兜一次（合并时 target 覆盖 generic）
+          cat ../config/kernel-extra.config >> "$KCFG"
+
+          echo "  --- 处理后 ---"
+          grep -n 'DEVMEM' "$GENC" "$KCFG" || true
+
+          echo "===== 3/4 打包进镜像的文件 ====="
+          mkdir -p files
+          if [ -d ../files ]; then
+            cp -av ../files/. files/
+          else
+            echo "  (仓库里没有 files/，跳过)"
+          fi
+
+          echo "===== 4/4 生成 .config ====="
+          cp ../config/buildroot.config .config
+          make defconfig
+
+          if [ "${{ inputs.with_luci }}" = "true" ]; then
+            echo "  追加 LuCI"
+            ./scripts/config -e PACKAGE_luci -e PACKAGE_luci-ssl
+            make defconfig
+          fi
+
+          if [ -n "${EXTRA_PKGS:-}" ]; then
+            echo "  追加额外包: $EXTRA_PKGS"
+            for p in $EXTRA_PKGS; do
+              ./scripts/config -e "PACKAGE_$p" || echo "  (跳过 $p)"
+            done
+            make defconfig
+          fi
+
+          echo "----- 最终关键配置 -----"
+          grep -E '^CONFIG_TARGET_(ath79|ath79_generic|ath79_generic_DEVICE)|^CONFIG_PACKAGE_(kmod-i2c-gpio|kmod-gpio-pca953x|luci|i2c-tools)' .config || true
+        env:
+          EXTRA_PKGS: ${{ inputs.extra_packages }}
+
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j"$(nproc)" || make download -j1 V=s
+          echo "dl 目录大小: $(du -sh dl | cut -f1)"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cd openwrt
+          if ! make -j"$(nproc)" > build.log 2>&1; then
+            echo "::group::构建失败，日志尾部"
+            tail -n 400 build.log
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "构建完成"
+
+      - name: Verify kernel config actually took effect
+        run: |
+          cd openwrt
+          KCFG=$(find build_dir -maxdepth 5 -name '.config' -path '*linux-*' | head -n 1)
+          if [ -z "$KCFG" ]; then
+            echo "!! 找不到内核 .config，无法确认"; exit 1
+          fi
+          echo "内核 .config: $KCFG"
+          grep -E 'DEVMEM' "$KCFG" || true
+          if grep -q '^CONFIG_DEVMEM=y$' "$KCFG"; then
+            echo "✓ CONFIG_DEVMEM 已生效"
+          else
+            echo "✗ CONFIG_DEVMEM 没进内核，/dev/mem 方案会失效"; exit 1
+          fi
+          if grep -q '^CONFIG_IO_STRICT_DEVMEM=y$' "$KCFG"; then
+            echo "✗ IO_STRICT_DEVMEM 仍然开着，mmap 0x1f000000 会被拒绝"; exit 1
+          else
+            echo "✓ IO_STRICT_DEVMEM 已关闭"
+          fi
+
+      - name: Show artifacts
+        run: |
+          cd openwrt
+          ls -lh bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/
+          echo "----- sysupgrade 校验 -----"
+          sha256sum bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/*sysupgrade.bin || true
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-ptsp01-${{ inputs.openwrt_ref }}
+          path: |
+            openwrt/bin/targets/ath79/generic/*.bin
+            openwrt/bin/targets/ath79/generic/*.manifest
+            openwrt/bin/targets/ath79/generic/sha256sums
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: openwrt/build.log
+          if-no-files-found: ignore
+          retention-days: 7
