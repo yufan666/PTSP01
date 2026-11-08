@@ -1,0 +1,39 @@
+#!/bin/sh
+# PTSP01 首次启动：固定 MAC 地址
+#
+# 背景：本机 ART（0xFF0000）是 AP121F 那套布局
+#         +0x0000 = FF FF FF FF FF FF      <- carambola2 的 DTS 从这里取，全是 FF
+#         +0x1000 = 02 02 C4 CD 45 20 82 55
+#         +0x1002 = C4 CD 45 20 82 55      <- 真实 MAC 在这里
+#       直接刷 carambola2 会让内核随机生成 MAC，每次重启 IP 都变。
+#
+# 又不方便改 DTS 的 nvmem 偏移：MAC(0x1002) 夹在 calibration(0x1000+0x440) 内部，
+# 改偏移会造成 nvmem cell 重叠。所以在这里写死。
+
+BASE_MAC="C4:CD:45:20:82:55"
+WAN_MAC="C4:CD:45:20:82:56"
+WLAN_MAC="C4:CD:45:20:82:57"
+
+[ -f /etc/config/network ] || exit 0
+
+# br-lan 的 MAC 必须设在 device 段，interface 段对 bridge 不生效
+i=0
+while [ "$i" -le 10 ]; do
+	if [ "$(uci -q get "network.@device[$i].name")" = "br-lan" ]; then
+		uci -q set "network.@device[$i].macaddr=$BASE_MAC"
+		break
+	fi
+	i=$((i + 1))
+done
+
+uci -q set "network.lan.macaddr=$BASE_MAC"
+uci -q set "network.wan.macaddr=$WAN_MAC"
+uci -q commit network
+
+if [ -f /etc/config/wireless ]; then
+	uci -q get wireless.radio0 >/dev/null 2>&1 && \
+		uci -q set "wireless.radio0.macaddr=$WLAN_MAC"
+	uci -q commit wireless
+fi
+
+exit 0

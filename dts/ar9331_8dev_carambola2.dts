@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+//
+// PTSP01 插排（邦讯玩儿插排）设备树
+// 硬件基线：8devices Carambola 2（AR9331 / 64MB DRAM / W25Q128 16MB）
+//
+// 相对上游 target/linux/ath79/dts/ar9331_8dev_carambola2.dts 的改动，
+// 每处均以 [PTSP01] 标注，来源都是 2026-11-08 对原厂 3.3.8 固件的实测：
+//
+//   1. ref 晶振 40MHz -> 25MHz
+//      原厂内核 log: AR9331 ref = 25MHz；不改会导致 UART 波特率 / SPI 时钟 / DDR 时序全偏
+//   2. 删除 /keys（WPS 键）
+//      它占 GPIO11，而 GPIO11 = PCA9554A 的 I2C SCL
+//   3. 删除 /leds/eth0、/leds/eth1
+//      分别占 GPIO13 / GPIO14，而 GPIO14 = PL7223 的 RST
+//   4. 新增 /i2c-gpio + PCA9554A(0x38)
+//      PL7223 的隔离使能、片选都挂在这颗扩展器上（原厂 ko 依赖 i2c_master_send/recv）
+//   5. &spi 下新增 spidev@1
+//      给 PL7223 留一个用户态出口；CS0 仍然归 spi-nor（flash）
+
+#include "ar9331.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "8devices Carambola2";
+	compatible = "8dev,carambola2", "qca,ar9331";
+
+	aliases {
+		label-mac-device = &wmac;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		wlan {
+			function = LED_FUNCTION_WLAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 0 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "phy0tpt";
+		};
+
+		/* [PTSP01] 上游这里的 eth0(GPIO13) / eth1(GPIO14) 已删除 */
+	};
+
+	/* [PTSP01] 上游的 /keys（wps@GPIO11）已删除 */
+
+	/*
+	 * [PTSP01] GPIO 模拟 I2C —— 接 PCA9554A
+	 *
+	 * 极性依据（原厂寄存器实测）：
+	 *   SDA(GPIO17)：OUT.bit17 恒 0 + 翻转 OE，空闲高靠板上 10k 上拉
+	 *                => 必须走「开漏模拟」，因此 **不能** 声明 i2c-gpio,sda-open-drain
+	 *                   （该属性在 i2c-gpio 驱动里语义反转：声明了反而变推挽）
+	 *   SCL(GPIO11)：OE.bit11 恒 1 推挽，板上无上拉
+	 *                => 声明 i2c-gpio,scl-has-no-pullup
+	 *
+	 * pinctrl-0 是必须的：0x28 的 bit3~7 是 ETH_SWITCH_LED0..4_EN，
+	 * 一旦为 1，GPIO17 的输出锁存立刻失效、被交换机 LED 输出接管，SDA 永远拉不低。
+	 * breed / U-Boot 在不同次上电后该位并不稳定，所以必须在内核里清掉。
+	 */
+	i2c_gpio: i2c-gpio {
+		compatible = "i2c-gpio";
+		status = "okay";
+
+		sda-gpios = <&gpio 17 GPIO_ACTIVE_HIGH>;
+		scl-gpios = <&gpio 11 GPIO_ACTIVE_HIGH>;
+		i2c-gpio,scl-has-no-pullup;
+		i2c-gpio,delay-us = <5>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&switch_led_disable_pins>;
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pca9554: gpio@38 {
+			compatible = "nxp,pca9554";
+			reg = <0x38>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+};
+
+&ref {
+	/* [PTSP01] 本板晶振 25MHz（carambola2 官方设计是 40MHz） */
+	clock-frequency = <25000000>;
+};
+
+&usb {
+	dr_mode = "host";
+	status = "okay";
+};
+
+&usb_phy {
+	status = "okay";
+};
+
+&spi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		spi-max-frequency = <50000000>;
+		reg = <0>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			uboot: partition@0 {
+				label = "u-boot";
+				reg = <0x000000 0x040000>;
+				read-only;
+			};
+
+			partition@40000 {
+				label = "u-boot-env";
+				reg = <0x040000 0x010000>;
+				read-only;
+			};
+
+			partition@50000 {
+				compatible = "denx,uimage";
+				label = "firmware";
+				reg = <0x50000 0xfa0000>;
+			};
+
+			partition@ff0000 {
+				label = "art";
+				reg = <0xff0000 0x010000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					/*
+					 * [PTSP01] 注意：本板 ART 是 AP121F 布局，真实 MAC 在 +0x1002，
+					 * 不是上游假设的 +0x0。上游 <0x0 0x6> 在本机会读到 FF:FF:FF:FF:FF:FF。
+					 *
+					 * 这里暂不改 nvmem 偏移 —— 因为 MAC 夹在 calibration(0x1000+0x440)
+					 * 内部，改偏移会造成 nvmem cell 重叠。MAC 改由
+					 * files/etc/uci-defaults/99-ptsp01-mac 在首次启动时写死。
+					 */
+					macaddr_art_0: macaddr@0 {
+						reg = <0x0 0x6>;
+					};
+
+					macaddr_art_6: macaddr@6 {
+						reg = <0x6 0x6>;
+					};
+
+					cal_art_1000: calibration@1000 {
+						reg = <0x1000 0x440>;
+					};
+				};
+			};
+		};
+	};
+
+	/*
+	 * [PTSP01] PL7223 的用户态出口。
+	 * AR934x 硬件 SPI 引擎最低只能到 clk/128 = 1.5625MHz（寄存器 6 位分频上限），
+	 * 原厂位带跑的是 125kHz。这里先按硬件下限挂上，真正的慢速通道
+	 * 由 /dev/mem 位带（CONFIG_DEVMEM）另做。
+	 */
+	spidev@1 {
+		compatible = "rohm,dh2228fv";
+		reg = <1>;
+		spi-max-frequency = <1600000>;
+	};
+};
+
+&mdio0 {
+	status = "okay";
+};
+
+&eth0 {
+	status = "okay";
+
+	nvmem-cells = <&macaddr_art_0>;
+	nvmem-cell-names = "mac-address";
+
+	gmac-config {
+		device = <&gmac>;
+
+		switch-phy-addr-swap = <1>;
+		switch-phy-swap = <1>;
+	};
+};
+
+&eth1 {
+	status = "okay";
+
+	nvmem-cells = <&macaddr_art_6>;
+	nvmem-cell-names = "mac-address";
+};
+
+&wmac {
+	status = "okay";
+
+	nvmem-cells = <&macaddr_art_6>, <&cal_art_1000>;
+	nvmem-cell-names = "mac-address", "calibration";
+};
