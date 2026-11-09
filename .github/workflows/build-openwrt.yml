@@ -299,16 +299,20 @@ jobs:
           echo "工具链: $GCC"
           "$GCC" --version | head -n 1
           cp ../tools/devmem.c devmem.c
+          cp ../tools/pl7223bb.c pl7223bb.c
           "$GCC" -static -O2 -o devmem devmem.c
-          "${GCC%gcc}strip" devmem || true
-          file devmem || true
-          ls -lh devmem
+          "$GCC" -static -O2 -o pl7223bb pl7223bb.c
+          "${GCC%gcc}strip" devmem pl7223bb || true
+          file devmem pl7223bb || true
+          ls -lh devmem pl7223bb
 
       - name: Upload userland tools
         uses: actions/upload-artifact@v4
         with:
           name: ptsp01-tools
-          path: openwrt/devmem
+          path: |
+            openwrt/devmem
+            openwrt/pl7223bb
           if-no-files-found: error
           retention-days: 30
 
