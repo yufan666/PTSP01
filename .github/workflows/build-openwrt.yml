@@ -241,6 +241,31 @@ jobs:
           echo "----- sysupgrade 校验 -----"
           sha256sum bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/*sysupgrade.bin || true
 
+      # 用 OpenWrt 工具链（与固件 ABI 完全一致：mips24kc 软浮点 O32 musl）
+      # 编译用户态工具。 zig cc 产出的 mips BE 静态二进制在 24Kc 上 SIGILL，
+      # 所以必须用同款工具链。
+      - name: Compile userland tools
+        run: |
+          set -euo pipefail
+          cd openwrt
+          GCC=$(find staging_dir -path '*toolchain*/bin' -name '*-gcc' | head -n 1)
+          [ -n "$GCC" ] || { echo "!! 找不到工具链 gcc"; exit 1; }
+          echo "工具链: $GCC"
+          "$GCC" --version | head -n 1
+          cp ../tools/devmem.c devmem.c
+          "$GCC" -static -O2 -o devmem devmem.c
+          "${GCC%gcc}strip" devmem || true
+          file devmem || true
+          ls -lh devmem
+
+      - name: Upload userland tools
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptsp01-tools
+          path: openwrt/devmem
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
