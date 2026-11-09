@@ -66,7 +66,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
-            rsync unzip zlib1g-dev file wget ccache
+            rsync unzip zlib1g-dev file wget ccache device-tree-compiler
 
       - name: Clone OpenWrt ${{ inputs.openwrt_ref }}
         run: |
@@ -216,6 +216,46 @@ jobs:
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
 
+      # 快速失败闸门：用系统 cpp+dtc 先编译一遍设备树。
+      # 上一轮 target/linux install 失败但日志里没有任何错误文本，
+      # 加这一步能在 5 分钟内把「DTS 本身有问题」和「镜像打包阶段有问题」区分开。
+      - name: Preflight - 编译检查设备树
+        run: |
+          set -uo pipefail
+          cd openwrt
+          DTS=target/linux/ath79/dts/ar9331_8dev_carambola2.dts
+          echo "dtc: $(dtc --version)"
+
+          # dt-bindings 在源码树里有多个副本（kernel/include、scripts/dtc 等），
+          # 内核还没解包，所以把能找到的都塞进 -I
+          INCS=$(find . -type d -name dt-bindings -print 2>/dev/null \
+                 | sed 's#/dt-bindings$##' | sort -u | sed 's/^/-I/' | tr '\n' ' ')
+          echo "include 路径: $INCS"
+
+          if ! cpp -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
+                   -I target/linux/ath79/dts $INCS \
+                   -o /tmp/pre.dts "$DTS" 2>/tmp/cpp.err; then
+            echo "::warning::cpp 预处理失败（多为 dt-bindings 缺失，非 DTS 本身问题），跳过预检"
+            cat /tmp/cpp.err | head -20
+            exit 0
+          fi
+          echo "预处理后 $(wc -l < /tmp/pre.dts) 行"
+
+          if ! dtc -I dts -O dtb -o /tmp/pre.dtb /tmp/pre.dts 2>/tmp/dtc.err; then
+            echo "!! dtc 编译失败："
+            cat /tmp/dtc.err
+            exit 1
+          fi
+          echo "----- dtc 警告（非致命）-----"
+          cat /tmp/dtc.err || true
+          echo "DTB $(stat -c %s /tmp/pre.dtb) 字节"
+
+          dtc -I dtb -O dts /tmp/pre.dtb > /tmp/pre.out.dts 2>/dev/null
+          echo "----- spi 节点 -----"
+          sed -n '/spi@1f000000/,/^\t};/p' /tmp/pre.out.dts | head -70
+          echo "----- cs-gpios / num-cs / spidev -----"
+          grep -nE "cs-gpios|num-cs|spidev@|flash@" /tmp/pre.out.dts | head -20
+
       - name: Download sources
         run: |
           cd openwrt
@@ -226,13 +266,24 @@ jobs:
         run: |
           set -o pipefail
           cd openwrt
-          if ! make -j"$(nproc)" > build.log 2>&1; then
+          if ! stdbuf -oL -eL make -j"$(nproc)" > build.log 2>&1; then
             echo "::group::构建失败，日志尾部"
+            echo "build.log 大小: $(stat -c %s build.log) 字节, $(wc -l < build.log) 行"
             tail -n 400 build.log
+            echo "::endgroup::"
+            echo "::group::错误行检索"
+            grep -n -iE "error|Error [0-9]|failed|No space|Killed|undefined reference" build.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::用 V=s 重跑 target/linux install 取真实错误"
+            make target/linux/install V=s 2>&1 | tail -n 200 || true
+            echo "::endgroup::"
+            echo "::group::磁盘 / 内存"
+            df -h /
+            free -m
             echo "::endgroup::"
             exit 1
           fi
-          echo "构建完成"
+          echo "构建完成，build.log $(stat -c %s build.log) 字节"
 
       - name: Show artifacts
         run: |
