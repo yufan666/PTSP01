@@ -162,19 +162,42 @@ jobs:
           #   # CONFIG_KERNEL_DEVMEM is not set
           # 这行被 awk 追加后就覆盖了我们补进 target config 的 DEVMEM=y。
           # 对策：在 buildroot 层也打开它，这样 awk 追加的就是 CONFIG_DEVMEM=y。
-          ./scripts/config -e KERNEL_DEVMEM
+          # 注意：不能调 ./scripts/config —— OpenWrt 源码树里 scripts/config 是
+          # 【目录】（kconfig 工具源码 conf.c/mconf.c 所在），不是可执行文件，
+          # 直接执行会报 "Is a directory"（exit 126）。改用 sed 翻行：
+          #   符号存在且为 not set -> sed 翻成 y（defconfig 会保留合法的显式 y）
+          #   符号不存在           -> 直接追加，defconfig 会丢弃未知符号，无副作用
+          if grep -q '^# CONFIG_KERNEL_DEVMEM is not set$' .config; then
+            sed -i 's/^# CONFIG_KERNEL_DEVMEM is not set$/CONFIG_KERNEL_DEVMEM=y/' .config
+            echo "  已翻 KERNEL_DEVMEM: not set -> y"
+          else
+            echo 'CONFIG_KERNEL_DEVMEM=y' >> .config
+            echo "  (buildroot 层原本无 KERNEL_DEVMEM 行，直接追加 y)"
+          fi
           make defconfig
 
+          enable_pkg() {
+            # 等价于旧版 ./scripts/config -e（那个写法在 OpenWrt 里是目录，跑不了）
+            if grep -q "^# CONFIG_PACKAGE_$1 is not set$" .config; then
+              sed -i "s/^# CONFIG_PACKAGE_$1 is not set$/CONFIG_PACKAGE_$1=y/" .config
+            else
+              echo "CONFIG_PACKAGE_$1=y" >> .config
+            fi
+          }
+
           if [ "${{ inputs.with_luci }}" = "true" ]; then
-            echo "  追加 LuCI"
-            ./scripts/config -e PACKAGE_luci -e PACKAGE_luci-ssl
+            echo "  追加 LuCI（先装 feeds，否则 luci 符号不在 kconfig 里，会被 defconfig 丢弃）"
+            ./scripts/feeds update -a
+            ./scripts/feeds install luci
+            enable_pkg luci
+            enable_pkg luci-ssl
             make defconfig
           fi
 
           if [ -n "${EXTRA_PKGS:-}" ]; then
             echo "  追加额外包: $EXTRA_PKGS"
             for p in $EXTRA_PKGS; do
-              ./scripts/config -e "PACKAGE_$p" || echo "  (跳过 $p)"
+              enable_pkg "$p"
             done
             make defconfig
           fi
