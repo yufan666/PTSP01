@@ -1,129 +1,52 @@
-name: Build OpenWrt for PTSP01
+name: Debug kconfig merge (DEVMEM)
 
-# 云编译 PTSP01 插排（AR9331 / 16MB flash / 64MB RAM）专用 OpenWrt 固件
-#
-# 为什么必须走「源码编译」而不是官方 Image Builder：
-#   Image Builder 用的是预编译内核，改不了内核 config。
-#   而我们需要 CONFIG_DEVMEM —— PL7223 原厂驱动是位带写法（直接读写 SPI 块
-#   的 IOC/RDS 寄存器，125kHz），硬件 SPI 引擎最低只到 1.5625MHz，
-#   只有拿到 /dev/mem 才能在用户态复刻原厂时序。
-#
-# 用法：仓库 → Actions → Build OpenWrt for PTSP01 → Run workflow
+# 诊断用：3~4 分钟复现 OpenWrt 内核 config 的完整生成链，
+# 定位 CONFIG_DEVMEM=y 在哪一步被吃掉。不编译内核，只跑元数据处理。
 
 on:
   workflow_dispatch:
-    inputs:
-      openwrt_ref:
-        description: 'OpenWrt tag / branch'
-        required: true
-        default: 'v25.12.0'
-        type: string
-      with_luci:
-        description: '打包 LuCI 网页界面（会多花约 25 分钟）'
-        required: true
-        default: false
-        type: boolean
-      extra_packages:
-        description: '额外包，空格分隔（例如 "wpad-mini kmod-usb-storage"）'
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: read
 
-concurrency:
-  group: build-${{ inputs.openwrt_ref }}
-  cancel-in-progress: false
-
-env:
-  OPENWRT_REF: ${{ inputs.openwrt_ref }}
-  TARGET: ath79
-  SUBTARGET: generic
-  PROFILE: 8dev_carambola2
-
 jobs:
-  build:
-    name: build ath79/generic
+  debug:
+    name: debug kconfig
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # OpenWrt 全量编译大约要 15~20GB，标准 runner 余量不够，先清一下
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
-          sudo apt-get clean
-          df -h /
-
-      - name: Install build dependencies
+      - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
-            rsync unzip zlib1g-dev file wget ccache
+          sudo apt-get install -y gawk libncurses-dev
 
-      - name: Clone OpenWrt ${{ inputs.openwrt_ref }}
+      - name: Clone OpenWrt v25.12.0
         run: |
-          git clone --depth 1 --branch "$OPENWRT_REF" \
+          git clone --depth 1 --branch v25.12.0 \
             https://github.com/openwrt/openwrt.git openwrt
           cd openwrt
-          git log -1 --format='构建基线: %H  %s'
+          git log -1 --format='基线: %H %s'
 
-      - name: Restore downloads cache
-        uses: actions/cache@v4
-        with:
-          path: openwrt/dl
-          key: dl-${{ env.TARGET }}-${{ inputs.openwrt_ref }}
-          restore-keys: |
-            dl-${{ env.TARGET }}-
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ env.TARGET }}-${{ inputs.openwrt_ref }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ env.TARGET }}-${{ inputs.openwrt_ref }}-
-            ccache-${{ env.TARGET }}-
-
-      - name: Apply PTSP01 customizations
+      # ===== 与主 workflow 的 Apply 2/4 段完全一致 =====
+      - name: Apply same patches as main workflow
         run: |
           set -euo pipefail
           cd openwrt
-
-          echo "===== 1/4 设备树 ====="
-          cp -v ../dts/ar9331_8dev_carambola2.dts \
-                target/linux/ath79/dts/ar9331_8dev_carambola2.dts
-
-          echo "===== 2/4 内核：打开 /dev/mem ====="
-          # 直接从 ath79 的 Makefile 读内核版本号，避免 ls|sort 猜错文件
           KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/ath79/Makefile | tr -d ' \t')
           GENC="target/linux/generic/config-$KVER"
           KCFG="target/linux/ath79/config-$KVER"
           for f in "$GENC" "$KCFG"; do
             [ -f "$f" ] || { echo "!! 缺少 $f"; exit 1; }
           done
-          echo "  内核版本 : $KVER"
-          echo "  generic  : $GENC"
-          echo "  target   : $KCFG"
+          echo "内核版本: $KVER  GENC=$GENC  KCFG=$KCFG"
 
-          # 背景：OpenWrt 用 kconfig.pl 依序合并 generic -> target -> subtarget
-          # 三份 config，后者覆盖前者；而对同一文件内的重复条目是「后出现的赢」。
-          # 上一版只 sed generic + 追加 target，结果 DEVMEM 仍是 n —— 说明顺序
-          # 假设不可靠。这里把 generic、target、以及全部子目标 config-default
-          # 的末尾都写入，无论 merge 顺序如何，结果都必然是 y。
           DEVMEM_BLOCK=$(cat ../config/kernel-extra.config)
           MARK='# ==== PTSP01: /dev/mem for PL7223 bitbang ===='
 
-          # 坑 1：generic 里显式写了 "# CONFIG_DEVMEM is not set"，翻成 y
-          # 坑 2：IO_STRICT_DEVMEM=y 会拦掉已被驱动登记的 I/O 区域，关掉
-          # （正则容忍行尾空白/CR，避免匹配失败后静默无效）
           sed -i -E 's/^[[:space:]]*#[[:space:]]*CONFIG_DEVMEM[[:space:]]+is not set[[:space:]]*$/CONFIG_DEVMEM=y/' "$GENC"
           sed -i -E 's/^CONFIG_IO_STRICT_DEVMEM=y[[:space:]]*$/# CONFIG_IO_STRICT_DEVMEM is not set/' "$GENC"
 
@@ -132,116 +55,91 @@ jobs:
           for sf in target/linux/ath79/*/config-default; do
             [ -f "$sf" ] || continue
             printf '\n%s\n%s\n' "$MARK" "$DEVMEM_BLOCK" >> "$sf"
-            echo "  已追加: $sf"
           done
 
-          echo "  --- 处理后 ---"
-          grep -n 'DEVMEM' "$GENC" "$KCFG" target/linux/ath79/*/config-default || true
+          grep -q '^CONFIG_DEVMEM=y$' "$GENC" || { echo "!! generic 未写入"; exit 1; }
+          grep -q '^CONFIG_DEVMEM=y$' "$KCFG" || { echo "!! target 未写入"; exit 1; }
+          echo "✓ 补丁已写入（与主 workflow 相同）"
 
-          # 自检：写不进去就当场报错，不要白跑 40 分钟
-          grep -q '^CONFIG_DEVMEM=y$' "$GENC" || { echo "!! generic 未写入 DEVMEM=y"; exit 1; }
-          grep -q '^CONFIG_DEVMEM=y$' "$KCFG" || { echo "!! target 未写入 DEVMEM=y"; exit 1; }
-          echo "  ✓ DEVMEM=y 已写入 generic + target + 全部 subtarget"
+          # 证据 1：三份文件的 DEVMEM 相关行 + 文件尾
+          mkdir -p "$GITHUB_WORKSPACE/debug"
+          D="$GITHUB_WORKSPACE/debug"
+          grep -n 'DEVMEM' "$GENC" "$KCFG" target/linux/ath79/*/config-default > "$D/00_patched_devmem_lines.txt" || true
+          tail -8 "$GENC" > "$D/01_generic_tail.txt"
+          tail -8 "$KCFG" > "$D/02_target_tail.txt"
+          tail -8 target/linux/ath79/generic/config-default > "$D/03_subtarget_tail.txt"
+          echo "--- generic/config-6.12 尾部 ---"; cat "$D/01_generic_tail.txt"
 
-          echo "===== 3/4 打包进镜像的文件 ====="
-          mkdir -p files
-          if [ -d ../files ]; then
-            cp -av ../files/. files/
-          else
-            echo "  (仓库里没有 files/，跳过)"
-          fi
-
-          echo "===== 4/4 生成 .config ====="
+      # ===== 生成 buildroot .config（DUMP 元数据需要） =====
+      - name: make defconfig
+        run: |
+          cd openwrt
           cp ../config/buildroot.config .config
           make defconfig
 
-          if [ "${{ inputs.with_luci }}" = "true" ]; then
-            echo "  追加 LuCI"
-            ./scripts/config -e PACKAGE_luci -e PACKAGE_luci-ssl
-            make defconfig
-          fi
-
-          if [ -n "${EXTRA_PKGS:-}" ]; then
-            echo "  追加额外包: $EXTRA_PKGS"
-            for p in $EXTRA_PKGS; do
-              ./scripts/config -e "PACKAGE_$p" || echo "  (跳过 $p)"
-            done
-            make defconfig
-          fi
-
-          echo "----- 最终关键配置 -----"
-          grep -E '^CONFIG_TARGET_(ath79|ath79_generic|ath79_generic_DEVICE)|^CONFIG_PACKAGE_(kmod-i2c-gpio|kmod-gpio-pca953x|luci|i2c-tools)' .config || true
-        env:
-          EXTRA_PKGS: ${{ inputs.extra_packages }}
-
-      - name: Download sources
+      # ===== 证据 2：make 自己认为的 merge 命令是什么 =====
+      - name: Capture real LINUX_CONF_CMD
         run: |
           cd openwrt
-          make download -j"$(nproc)" || make download -j1 V=s
-          echo "dl 目录大小: $(du -sh dl | cut -f1)"
+          D="$GITHUB_WORKSPACE/debug"
+          make -C target/linux DUMP=1 -n 2>/dev/null | grep -o 'scripts/kconfig\.pl.*' | head -2 > "$D/10_real_merge_cmd.txt" || echo "(未能捕获)" > "$D/10_real_merge_cmd.txt"
+          echo "--- OpenWrt 实际使用的 merge 命令 ---"
+          cat "$D/10_real_merge_cmd.txt" || true
 
-      - name: Build
-        run: |
-          set -o pipefail
-          cd openwrt
-          if ! make -j"$(nproc)" > build.log 2>&1; then
-            echo "::group::构建失败，日志尾部"
-            tail -n 400 build.log
-            echo "::endgroup::"
-            exit 1
-          fi
-          echo "构建完成"
-
-      - name: Show artifacts
+      # ===== 证据 3：跑 OpenWrt 自己的 DUMP 合并 =====
+      - name: Run real DUMP merge
         run: |
           cd openwrt
-          ls -lh bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/
-          echo "----- sysupgrade 校验 -----"
-          sha256sum bin/targets/${{ env.TARGET }}/${{ env.SUBTARGET }}/*sysupgrade.bin || true
+          D="$GITHUB_WORKSPACE/debug"
+          make -C target/linux DUMP=1 >/dev/null 2>&1 || echo "(DUMP 有告警，继续)"
+          echo "--- tmp/.kconfig-* 中的 DEVMEM 行（OpenWrt 官方 merge 结果） ---"
+          ls tmp/.kconfig-* 2>/dev/null || echo "(没找到 tmp/.kconfig-*)"
+          grep -n 'DEVMEM' tmp/.kconfig-* > "$D/11_dump_merge_devmem.txt" || echo "!! DUMP 合并结果里没有 DEVMEM 行" | tee "$D/11_dump_merge_devmem.txt"
+          cat "$D/11_dump_merge_devmem.txt"
 
-      - name: Upload firmware
+      # ===== 证据 4：按我理解的顺序手工 merge =====
+      - name: Manual merge in believed order
+        run: |
+          cd openwrt
+          D="$GITHUB_WORKSPACE/debug"
+          perl scripts/kconfig.pl + + \
+            target/linux/generic/config-6.12 \
+            target/linux/ath79/config-6.12 \
+            target/linux/ath79/generic/config-default \
+            > "$D/12_manual_merge.cfg" || echo "(手工 merge 失败)"
+          echo "--- 手工 merge（generic→target→subtarget）的 DEVMEM 行 ---"
+          grep -n 'DEVMEM' "$D/12_manual_merge.cfg" || echo "!! 手工 merge 结果无 DEVMEM 行"
+          grep -c 'CONFIG_DEVMEM=y' "$D/12_manual_merge.cfg" || true
+
+      # ===== 证据 5：完整复刻 Kernel/Configure/Default 的数据流 =====
+      - name: Replicate Kernel/Configure/Default
+        run: |
+          cd openwrt
+          D="$GITHUB_WORKSPACE/debug"
+          # 逐行复刻 include/kernel-defaults.mk 的 Kernel/Configure/Default：
+          perl scripts/kconfig.pl + + \
+            target/linux/generic/config-6.12 \
+            target/linux/ath79/config-6.12 \
+            target/linux/ath79/generic/config-default > /tmp/.config.target
+          awk '/^(#[[:space:]]+)?CONFIG_KERNEL/{sub("CONFIG_KERNEL_","CONFIG_");print}' .config >> /tmp/.config.target
+          echo "# CONFIG_KALLSYMS_EXTRA_PASS is not set" >> /tmp/.config.target
+          echo "# CONFIG_KALLSYMS_ALL is not set" >> /tmp/.config.target
+          echo "CONFIG_KALLSYMS_UNCOMPRESSED=y" >> /tmp/.config.target
+          perl scripts/package-metadata.pl kconfig tmp/.packageinfo .config 6.12 > /tmp/.config.override
+          perl scripts/kconfig.pl 'm+' '+' /tmp/.config.target /dev/null /tmp/.config.override > /tmp/.config.set
+          echo "===== .config.target 的 DEVMEM 行 ====="
+          grep -n 'DEVMEM' /tmp/.config.target || echo "!! .config.target 无 DEVMEM 行"
+          echo "===== .config.override 的 DEVMEM 行 ====="
+          grep -n 'DEVMEM' /tmp/.config.override || echo "(.config.override 无 DEVMEM 行，正常)"
+          echo "===== .config.set 的 DEVMEM 行（= 内核 .config 的最终来源） ====="
+          grep -n 'DEVMEM' /tmp/.config.set || echo "!! .config.set 无 DEVMEM 行 —— 找到凶手环节"
+          cp /tmp/.config.target /tmp/.config.override /tmp/.config.set "$D/" 2>/dev/null || true
+
+      # ===== 打包全部证据 =====
+      - name: Upload debug evidence
         uses: actions/upload-artifact@v4
         with:
-          name: openwrt-ptsp01-${{ inputs.openwrt_ref }}
-          path: |
-            openwrt/bin/targets/ath79/generic/*.bin
-            openwrt/bin/targets/ath79/generic/*.manifest
-            openwrt/bin/targets/ath79/generic/sha256sums
-          if-no-files-found: error
-          retention-days: 30
-
-      # 固件已上传完成后再做校验：即使这里挂了，artifact 也不会丢
-      - name: Verify kernel config actually took effect
-        run: |
-          cd openwrt
-          # 注意：不能用 -path '*linux-*' —— mac80211 的 backports 源码树里
-          # 也有自己的 .config（build_dir/target-*/mac80211-regular/backports-*/.config），
-          # find 顺序靠前就会抓错文件，误判 DEVMEM 没生效。
-          # 用 *linux-6* 锁定真正的内核构建目录（内核源码树形如 linux-6.12.71）。
-          KCFG=$(find build_dir -maxdepth 5 -path '*linux-6*/.config' | head -n 1)
-          if [ -z "$KCFG" ]; then
-            echo "!! find 没匹配到内核 .config，所有候选如下（用于排查）："
-            find build_dir -maxdepth 5 -name '.config' | head -n 20
-            exit 1
-          fi
-          echo "内核 .config: $KCFG"
-          grep -E 'DEVMEM' "$KCFG" || true
-          if grep -q '^CONFIG_DEVMEM=y$' "$KCFG"; then
-            echo "✓ CONFIG_DEVMEM 已生效"
-          else
-            echo "✗ CONFIG_DEVMEM 没进内核，/dev/mem 方案会失效"; exit 1
-          fi
-          if grep -q '^CONFIG_IO_STRICT_DEVMEM=y$' "$KCFG"; then
-            echo "✗ IO_STRICT_DEVMEM 仍然开着，mmap 0x1f000000 会被拒绝"; exit 1
-          else
-            echo "✓ IO_STRICT_DEVMEM 已关闭"
-          fi
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: openwrt/build.log
-          if-no-files-found: ignore
+          name: debug-kconfig
+          path: ${{ github.workspace }}/debug/
+          if-no-files-found: warn
           retention-days: 7
