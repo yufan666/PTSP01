@@ -98,6 +98,21 @@
 };
 
 &spi {
+	/*
+	 * [PTSP01] 强制绑定位带驱动。
+	 * OpenWrt 的 ath79.dtsi 把这个节点声明成 "qca,ar934x-spi"（硬件引擎），
+	 * 实测（2026-11-09，initramfs c12fa92）它接管后：
+	 *   spi spi0.1: spi clock is too low        <- 125kHz 被拒（分频 6 位，最低 1.5625MHz）
+	 *   spi-ar934x 1f000000.spi: cs3 >= max 3   <- 不解析 cs-gpios，num_chipselect 恒 3
+	 * 三个 PL7223 孔全部注册失败。
+	 * 改成 "qca,ar7100-spi" 绑回 spi-ath79（spi_bitbang 位带实现）：
+	 *   - use_gpio_descriptors=true，cs-gpios 生效，num_chipselect 抬到 4；
+	 *   - cs->nsecs=(1e9/2)/hz，125kHz = 半位 4000ns，正好复刻原厂 udelay(4)；
+	 *   - flash 走同一个驱动（AR71xx 时代所有 ath79 设备都是它带的 flash，
+	 *     mem_ops 快读只对原生 CS0 生效，本板 flash 正是 CS0）。
+	 */
+	compatible = "qca,ar7100-spi";
+
 	status = "okay";
 
 	/*
