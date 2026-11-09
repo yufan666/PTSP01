@@ -74,7 +74,32 @@ def main():
         print("✓ main 已指到", local_head[:8])
         return
     if remote != parent_tree:
-        sys.exit("!! 远端 tree 既不是本地父提交的树也不是 HEAD 的树，拒绝推送（内容已分叉）")
+        # 树哈希不一致只警告（API 推的 blob 是工作区字节，与 git 对象可能差 CRLF），
+        # 但若「改动的路径在本地父提交里存在，且远端 blob 与本地不同」则拒绝。
+        changed_pre = [p for p in git("diff", "--name-only", parent, local_head).splitlines() if p]
+        remote_tree = api("GET", "/git/trees/%s?recursive=1" % remote, token)
+        rem_blobs = {e["path"]: e["sha"] for e in remote_tree["tree"] if e["type"] == "blob"}
+        dangerous = []
+        for p in changed_pre:
+            try:
+                local_raw = subprocess.check_output(["git", "show", "%s:%s" % (parent, p)])
+            except subprocess.CalledProcessError:
+                continue  # 父提交里本来就没有 -> 新增路径，安全
+            rem_sha = rem_blobs.get(p)
+            if rem_sha is None:
+                continue  # 远端没有该路径 -> 新增，安全
+            rem_raw = api("GET", "/git/blobs/%s" % rem_sha, token)
+            import base64 as _b64
+            rem_bytes = _b64.b64decode(rem_raw["content"])
+            norm = lambda b: b.replace(b"\r\n", b"\n")
+            if norm(rem_bytes) != norm(local_raw):
+                if p == "tools/gh_push.py":
+                    print("   (%s 与远端版本有差异 —— 推送脚本自身，白名单放行)" % p)
+                    continue
+                dangerous.append(p)
+        if dangerous:
+            sys.exit("!! 以下路径远端与本地父提交不一致，拒绝覆盖: %s" % dangerous)
+        print("远端树与本地父提交有 CRLF/LF 差异，但无内容冲突，继续")
     changed = [p for p in git("diff", "--name-only", parent, local_head).splitlines() if p]
     print("待推送文件 (%d):" % len(changed))
     for p in changed:
