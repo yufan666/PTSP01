@@ -100,6 +100,39 @@
 &spi {
 	status = "okay";
 
+	/*
+	 * [PTSP01] PL7223 的片选：全部走 cs-gpios，
+	 * SPI 核心用 gpiod 拉片选，控制器只负责 CLK/MOSI/MISO 的位带。
+	 * 这是原厂 flash_spi_down 那套的现代等价物，时序由内核保证。
+	 *
+	 * 为什么不用 /dev/mem 自己做位带（2026-11-09 实测）：
+	 *   从用户态经 /dev/mem 写 SPI 控制器 IOC 寄存器（0x1f000008）无效
+	 *   —— 写 0x12345678 回读仍是 0x70000，GPIO IN 也不跟随。
+	 *   而内核 spi-ath79 本身就是位带驱动（spi_bitbang + 手写 IOC），
+	 *   jedec_id 能读回 ef4018，证明内核侧写 IOC 完全正常。
+	 *   => 位带只能由内核做。
+	 *
+	 * ⚠ spi-ath79 置了 SPI_CONTROLLER_GPIO_SS，spi_set_cs() 会在拨完
+	 *   cs-gpios 之后**再调一次控制器的 chipselect**，即写 IOC bit(16+reg)。
+	 *   IOC bit17 = 硬件 CS1 引脚 = GPIO17 = 本板 I²C SDA，
+	 *   IOC bit18 = GPIO18。所以「走扩展器」的那个孔特意安排到 reg=3
+	 *   （IOC bit19，无对应引脚，绝对无害）。
+	 *
+	 * cs-gpios 索引 = spi 设备的 reg：
+	 *   [0] <0>          -> flash 仍用控制器原生 CS0（官方 binding 里
+	 *                       "<0>" 就是「本项用原生片选」的写法）
+	 *   [1] GPIO26       -> PL7223 孔3 片选（原厂 CS3=26）
+	 *   [2] GPIO1        -> PL7223 孔2 片选（原厂 CS2=1）
+	 *   [3] expander P1  -> PL7223 孔1 片选（原厂 CS=17，即虚拟 GPIO 16+1）
+	 *
+	 * 注意：cs-gpios / num-cs 必须写在所有子节点之前 ——
+	 * dtc 只允许属性先于子节点，否则报
+	 * "Properties must precede subnodes"（曾因此让整个构建挂在 install 阶段）。
+	 */
+	cs-gpios = <0>, <&gpio 26 GPIO_ACTIVE_LOW>,
+		   <&gpio 1 GPIO_ACTIVE_LOW>, <&pca9554 1 GPIO_ACTIVE_LOW>;
+	num-cs = <4>;
+
 	flash@0 {
 		compatible = "jedec,spi-nor";
 		spi-max-frequency = <50000000>;
@@ -161,39 +194,6 @@
 			};
 		};
 	};
-
-	/*
-	 * [PTSP01] PL7223 的用户态出口。
-	 *
-	 * 重要教训（2026-11-09 实测）：
-	 *   1) 从用户态经 /dev/mem 写 SPI 控制器 IOC 寄存器（0x1f000008）无效
-	 *      —— 写 0x12345678 回读仍是 0x70000，GPIO IN 也不跟随。
-	 *      而内核驱动 spi-ath79 本身是位带实现（spi_bitbang + 手写 IOC），
-	 *      jedec_id 能读回 ef4018，证明**内核侧写 IOC 完全正常**。
-	 *      => 位带只能由内核做，用户态不要碰 SPI 寄存器。
-	 *   2) 上一版把 spidev 挂在 reg=<1>（硬件 CS1 = IOC bit17 = GPIO17），
-	 *      而 GPIO17 是本板 PCA9554A 的 I2C SDA，直接用 dd 访问会把 I2C 总线打乱。
-	 *
-	 * 因此改为：CS 全部走 cs-gpios（SPI 核心用 gpiod 拉片选，
-	 * 控制器只负责 CLK/MOSI/MISO 的位带），这就是原厂 flash_spi_down 那套的
-	 * 现代等价物，且时序由内核保证。
-	 *
-	 * ⚠ 还有一个坑：spi-ath79 置了 SPI_CONTROLLER_GPIO_SS，spi_set_cs() 会在
-	 *   拨完 cs-gpios 之后**再调一次控制器的 chipselect**，即写 IOC bit(16+cs)。
-	 *   IOC bit17 = 硬件 CS1 引脚 = GPIO17 = 本板 I²C SDA！
-	 *   所以 reg=1 会顺带把 SDA 拨一下（仅产生无效的 START/STOP），
-	 *   但为了不让它和扩展器的 I²C 事务重叠，特意把「走扩展器」的那个孔安排到
-	 *   reg=3（IOC bit19，无对应引脚，绝对无害）。
-	 *
-	 * cs-gpios 索引 = spi 设备的 reg：
-	 *   [0] 0            -> flash 仍用控制器原生 CS0
-	 *   [1] GPIO26       -> PL7223 孔3 片选（原厂 CS3=26）
-	 *   [2] GPIO1        -> PL7223 孔2 片选（原厂 CS2=1）
-	 *   [3] expander P1  -> PL7223 孔1 片选（原厂 CS=17，即虚拟 GPIO 16+1）
-	 */
-	cs-gpios = <0>, <&gpio 26 GPIO_ACTIVE_LOW>,
-		   <&gpio 1 GPIO_ACTIVE_LOW>, <&pca9554 1 GPIO_ACTIVE_LOW>;
-	num-cs = <4>;
 
 	/*
 	 * 125kHz = 原厂位带速率（每个半位 4us），

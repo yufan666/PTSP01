@@ -216,6 +216,12 @@ jobs:
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
 
+      - name: Download sources
+        run: |
+          cd openwrt
+          make download -j"$(nproc)" || make download -j1 V=s
+          echo "dl 目录大小: $(du -sh dl | cut -f1)"
+
       # 快速失败闸门：用系统 cpp+dtc 先编译一遍设备树。
       # 上一轮 target/linux install 失败但日志里没有任何错误文本，
       # 加这一步能在 5 分钟内把「DTS 本身有问题」和「镜像打包阶段有问题」区分开。
@@ -226,16 +232,25 @@ jobs:
           DTS=target/linux/ath79/dts/ar9331_8dev_carambola2.dts
           echo "dtc: $(dtc --version)"
 
-          # dt-bindings 在源码树里有多个副本（kernel/include、scripts/dtc 等），
-          # 内核还没解包，所以把能找到的都塞进 -I
-          INCS=$(find . -type d -name dt-bindings -print 2>/dev/null \
-                 | sed 's#/dt-bindings$##' | sort -u | sed 's/^/-I/' | tr '\n' ' ')
-          echo "include 路径: $INCS"
+          # 秒级结构自检（属性必须先于子节点），比 dtc 报错早一小时
+          python3 ../tools/dts_lint.py "$DTS" || { echo "!! DTS 结构检查失败"; exit 1; }
+
+          # dt-bindings 在 OpenWrt 树里没有现成副本（scripts/dtc 是空 submodule），
+          # 但内核 tarball 已经由 make download 拉到 dl/ 了，从里面抠出 include/dt-bindings。
+          INCS=""
+          TB=$(ls -1 dl/linux-6.*.tar.* 2>/dev/null | head -n1)
+          if [ -n "${TB:-}" ]; then
+            echo "内核 tarball: $TB"
+            rm -rf /tmp/kinc && mkdir -p /tmp/kinc
+            tar -xf "$TB" -C /tmp/kinc --wildcards '*/include/dt-bindings' 2>/dev/null || true
+            INC=$(ls -d /tmp/kinc/*/include 2>/dev/null | head -n1)
+            [ -n "$INC" ] && INCS="-I $INC" && echo "dt-bindings: $INC"
+          fi
 
           if ! cpp -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
                    -I target/linux/ath79/dts $INCS \
                    -o /tmp/pre.dts "$DTS" 2>/tmp/cpp.err; then
-            echo "::warning::cpp 预处理失败（多为 dt-bindings 缺失，非 DTS 本身问题），跳过预检"
+            echo "::warning::cpp 预处理失败（dt-bindings 可能没抠出来），跳过预检"
             cat /tmp/cpp.err | head -20
             exit 0
           fi
@@ -250,17 +265,12 @@ jobs:
           cat /tmp/dtc.err || true
           echo "DTB $(stat -c %s /tmp/pre.dtb) 字节"
 
-          dtc -I dtb -O dts /tmp/pre.dtb > /tmp/pre.out.dts 2>/dev/null
+          dtc -I dtb -O dts /tmp/pre.dtb > /tmp/pre.out.dts 2>/dev/null || true
           echo "----- spi 节点 -----"
           sed -n '/spi@1f000000/,/^\t};/p' /tmp/pre.out.dts | head -70
           echo "----- cs-gpios / num-cs / spidev -----"
           grep -nE "cs-gpios|num-cs|spidev@|flash@" /tmp/pre.out.dts | head -20
 
-      - name: Download sources
-        run: |
-          cd openwrt
-          make download -j"$(nproc)" || make download -j1 V=s
-          echo "dl 目录大小: $(du -sh dl | cut -f1)"
 
       - name: Build
         run: |
