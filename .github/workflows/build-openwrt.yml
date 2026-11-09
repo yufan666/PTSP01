@@ -300,11 +300,13 @@ jobs:
           "$GCC" --version | head -n 1
           cp ../tools/devmem.c devmem.c
           cp ../tools/pl7223bb.c pl7223bb.c
+          cp ../tools/spitest.c spitest.c
           "$GCC" -static -O2 -o devmem devmem.c
           "$GCC" -static -O2 -o pl7223bb pl7223bb.c
-          "${GCC%gcc}strip" devmem pl7223bb || true
-          file devmem pl7223bb || true
-          ls -lh devmem pl7223bb
+          "$GCC" -static -O2 -o spitest spitest.c
+          "${GCC%gcc}strip" devmem pl7223bb spitest || true
+          file devmem pl7223bb spitest || true
+          ls -lh devmem pl7223bb spitest
 
       - name: Upload userland tools
         uses: actions/upload-artifact@v4
@@ -313,6 +315,7 @@ jobs:
           path: |
             openwrt/devmem
             openwrt/pl7223bb
+            openwrt/spitest
           if-no-files-found: error
           retention-days: 30
 
