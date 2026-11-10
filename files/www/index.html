@@ -105,20 +105,21 @@ function render(d){
   let html = '';
   for (let i = 1; i <= 3; i++){
     const s = sockets.find(x => x.id === i) || {on:false, err:true};
-    const on = !!s.on, e = !!s.err;
+    const e = !!s.err, unk = e;          // 通信失败 = 该孔状态未知（不是 OFF）
+    const on = !unk && !!s.on;
     html += `
       <div class="card ${on?'on':''}">
         <div class="head">
           <span class="name">${NAMES[i]}</span>
-          <span class="state ${on?'on':''}">${on?'ON':'OFF'}</span>
+          <span class="state ${on?'on':''}">${unk?'未知':(on?'ON':'OFF')}</span>
         </div>
         <div class="vals">
           <div class="vbox"><div class="n">${e?'--':fmt(s.v,1)}</div><div class="u">电压 V</div></div>
           <div class="vbox"><div class="n">${e?'--':fmt(s.a,3)}</div><div class="u">电流 A</div></div>
           <div class="vbox"><div class="n">${e?'--':fmt(s.w,2)}</div><div class="u">功率 W</div></div>
         </div>
-        <button id="btn${i}" class="${on?'':'off'}" ${busy[i]?'disabled':''}
-          onclick="toggle(${i})">${busy[i]?'操作中…':(on?'断开此孔':'接通此孔')}</button>
+        <button id="btn${i}" class="${on?'':'off'}" ${(busy[i]||unk)?'disabled':''}
+          onclick="toggle(${i})">${busy[i]?'操作中…':(unk?'暂不可用':(on?'断开此孔':'接通此孔'))}</button>
       </div>`;
   }
   g.innerHTML = html;

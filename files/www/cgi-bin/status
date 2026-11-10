@@ -21,6 +21,24 @@ esac
 if [ -z "$DATA" ]; then
   DATA=$(read_all_raw)
 fi
+
+# 快照里一孔计量都没有 → 免唤醒补读一次自愈。
+# 典型成因：旧版 do_switch 只把开关写进快照、计量留空，之后网页一直读这个脏快照。
+# 两个保险：① 30 秒内最多试一次，避免和网页轮询打架；② 置 PTSP01_NO_WAKE=1，
+# 保证这条路径只做免唤醒读取，probe 不通就放弃 —— 绝不会打 RST 把继电器断掉。
+has_v=$(printf '%s\n' "$DATA" | awk -F'|' '$3 != "" { f = 1 } END { print f + 0 }')
+if [ "$has_v" = "0" ]; then
+  now=$(cut -d. -f1 /proc/uptime 2>/dev/null); now=${now:-0}
+  try=$(cat /tmp/snap_try 2>/dev/null); try=${try:-0}
+  if [ $((now - try)) -ge 30 ]; then
+    echo "$now" > /tmp/snap_try
+    NEW=$(PTSP01_NO_WAKE=1 read_all_raw)
+    if printf '%s\n' "$NEW" | awk -F'|' '$3 != "" { f = 1 } END { exit !f }'; then
+      DATA=$NEW
+    fi
+  fi
+fi
+
 [ -n "$DATA" ] || DATA=$(printf '1|||\n2|||\n3|||')
 
 JSON=$(printf '%s\n' "$DATA" | awk -F'|' '

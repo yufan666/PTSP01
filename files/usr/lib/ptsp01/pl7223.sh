@@ -127,6 +127,17 @@ rd_u()  { spi_rx "$1" w70,00 r6; }        # 0x3000 电压
 rd_i()  { spi_rx "$1" w70,06 r6; }        # 0x3006 电流
 rd_p()  { spi_rx "$1" w70,78 r6; }        # 0x3078 功率
 
+# 同一寄存器连读 3 次取众数（3 次都不一致时取第 1 次）。
+# 为什么需要：插排没接市电时芯片不进计量，MISO 上是浮空噪声 ——
+# 单次读会在 000000000000 和 409500080000 之间乱跳，画面就会忽而 0.00 忽而天文数字。
+# 3 次里两次一致才算可信，能把绝大多数毛刺压掉。
+rd_mode3() {   # $1=dev $2=cmd（如 w70,00）
+  a=$(spi_rx "$1" "$2" r6); b=$(spi_rx "$1" "$2" r6); c=$(spi_rx "$1" "$2" r6)
+  if [ "$a" = "$b" ] || [ "$a" = "$c" ]; then printf '%s\n' "$a"
+  elif [ "$b" = "$c" ]; then printf '%s\n' "$b"
+  else printf '%s\n' "$a"; fi
+}
+
 wr_sw() {   # $1=dev $2=0|1
   d=00; [ "$2" = "1" ] && d=20
   spi_rx "$1" wB8,0F,$d r1 > /dev/null
@@ -144,17 +155,56 @@ rewrite_states() {
   fi
 }
 
-# ---------- 换算（同 decode_plt.py：u48 大端 / 2^n） ----------
-# conv <"b0 b1 ... b5"> <shift> → 4 位小数
+# ---------- 换算（原厂 pl7223_calcuate_value：u48 大端 / 2^n） ----------
+# conv <hex串> <shift> → 4 位小数
+# ⚠ spi_rx 已经把字节间空格 tr 掉了（"830800380000"），所以旧实现里的
+#   `for(i=1;i<=NF;i++) v=v*256+$i` 拿到的是一个 12 字符的整串，
+#   awk 按十进制去转它 → 值完全错，大数还会算出 inf。
+#   改为逐字符按 16 进制累加成浮点：u48 只有 48 位，double 的 53 位尾数装得下，
+#   不丢精度，也不依赖 shell 的整数宽度（ar9331 是 32 位 MIPS）。
 conv() {
-  echo "$1" | awk -v s="$2" '{
-    v=0; for(i=1;i<=NF;i++) v=v*256+$i
-    printf "%.4f", v/(2^s)
-  }'
+  printf '%s' "$1" | awk -v s="$2" '
+    { gsub(/[ \t\r\n]/, ""); h = tolower($0) }
+    END {
+      if (length(h) == 0) { print "0.0000"; exit }
+      n = 0
+      for (i = 1; i <= length(h); i++) {
+        d = index("0123456789abcdef", substr(h, i, 1)) - 1
+        if (d < 0) { print "0.0000"; exit }     # 非 hex = 读取失败
+        n = n * 16 + d
+      }
+      printf "%.4f", n / (2 ^ s)
+    }'
+}
+
+# 量程合理性检查：0 ≤ 值 ≤ 上限
+in_range() { awk -v x="$1" -v hi="$2" 'BEGIN { exit !(x + 0 >= 0 && x + 0 <= hi) }'; }
+
+# 三个原始读数 → "v|a|w"；任一超量程或缺失则整孔作废（"||"）
+# 为什么要卡量程：芯片没接市电时 MISO 上是噪声，会读出 10^7 V 这种值，
+# 直接显示会变成一串天文数字。卡掉后前端按"未知"显示 "--"，语义更诚实。
+calc3() {   # $1=电压原始 $2=电流原始 $3=功率原始
+  if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then printf '||\n'; return; fi
+  v=$(conv "$1" 22); a=$(conv "$2" 24); w=$(conv "$3" 24)
+  if in_range "$v" 400 && in_range "$a" 100 && in_range "$w" 22000; then
+    printf '%s|%s|%s\n' "$v" "$a" "$w"
+  else
+    printf '||\n'
+  fi
 }
 
 # 孔号 → spidev 设备
 spid_of() { case "$1" in 1) echo $SPID1;; 2) echo $SPID2;; 3) echo $SPID3;; esac; }
+
+# 读一个孔的计量 → "v|a|w"（失败为 "||"）
+# 调用方负责持锁与 iso（P0）状态；孔1 的 CS 窗口在本函数内部自管。
+measure1() {   # $1=孔号
+  d=$(spid_of "$1")
+  [ "$1" = "1" ] && cs17_lo
+  uv=$(rd_mode3 "$d" "w70,00"); iv=$(rd_mode3 "$d" "w70,06"); pv=$(rd_mode3 "$d" "w70,78")
+  [ "$1" = "1" ] && cs17_hi
+  calc3 "$uv" "$iv" "$pv"
+}
 
 # ---------- 上层编排（网页 CGI / MQTT 守护共用，单一事实来源） ----------
 
@@ -190,6 +240,17 @@ read_all_raw() {
   done
 
   if [ "$reachable" = "0" ] || [ -f /tmp/ptsp01_wake_always ]; then
+    # 免唤醒模式（PTSP01_NO_WAKE=1）：probe 不通就直接放弃，绝不打 RST 脉冲。
+    # RST 会把三颗 PL7223 的 0x380F 复位为 00 = 三个继电器全断开，等于远程断电。
+    # 供 status 的脏快照自愈使用：宁可这一轮没有数据，也不能把用户的设备断电。
+    if [ "$PTSP01_NO_WAKE" = "1" ] && [ ! -f /tmp/ptsp01_wake_always ]; then
+      printf '1|||\n2|||\n3|||\n' >&3
+      iso_close
+      btn_lock_free
+      web_lock_free
+      exec 3>&-
+      return
+    fi
     wake_all
     rewrite_states
     pca_wr 0x01     # 重开 P0=1（孔1 窗口可能已把它带掉）
@@ -204,7 +265,7 @@ read_all_raw() {
     dev=$(spid_of "$n")
     [ "$n" = "1" ] && cs17_lo
     sw=$(rd_sw "$dev")
-    uv=$(rd_u "$dev"); iv=$(rd_i "$dev"); pv=$(rd_p "$dev")
+    uv=$(rd_mode3 "$dev" "w70,00"); iv=$(rd_mode3 "$dev" "w70,06"); pv=$(rd_mode3 "$dev" "w70,78")
     [ "$n" = "1" ] && cs17_hi
 
     on=""
@@ -215,9 +276,8 @@ read_all_raw() {
       esac
     fi
     v=""; a=""; w=""
-    if [ -n "$uv" ] && [ -n "$iv" ] && [ -n "$pv" ]; then
-      v=$(conv "$uv" 22); a=$(conv "$iv" 24); w=$(conv "$pv" 24)
-    fi
+    mw=$(calc3 "$uv" "$iv" "$pv")     # 换算 + 量程检查（超量程则整孔作废）
+    v=${mw%%|*}; rest=${mw#*|}; a=${rest%%|*}; w=${rest#*|}
     line="$n|$on|$v|$a|$w"
     case "$n" in 1) o1=$line;; 2) o2=$line;; 3) o3=$line;; esac
   done
@@ -252,8 +312,23 @@ do_switch() {
     all) n1=$ST; n2=$ST; n3=$ST;;
   esac
 
-  wake_all
-  echo "0 0 0" > $STATE
+  # —— 能不能不打 RST 就写？——
+  # wake_all 会把三颗 PL7223 的 0x380F 全复位为 OFF，而孔1 在 S1_SPI=0 时
+  # 无法重写（CS 与 i2c SDA 共线），于是"点一次孔2 的开关 = 给孔1 断一次电"。
+  # 所以先 probe：芯片本来就醒着（ID=04）就直接写，节省 2 秒且不动孔1。
+  iso_open
+  reach=1
+  [ "$(rd_id "$SPID3")" = "04" ] || reach=0
+  [ "$(rd_id "$SPID2")" = "04" ] || reach=0
+  if [ "$S1_SPI" = "1" ]; then
+    cs17_lo; [ "$(rd_id "$SPID1")" = "04" ] || reach=0; cs17_hi
+    pca_wr 0x01        # 孔1 窗口用了 SDA，P0 隔离使能要重开
+  fi
+
+  if [ "$reach" = "0" ]; then
+    wake_all
+    echo "0 0 0" > $STATE     # 唤醒后三孔真实状态全 OFF
+  fi
   cs17_hi
   wr_sw "$SPID3" "$n3"
   wr_sw "$SPID2" "$n2"
@@ -279,14 +354,30 @@ do_switch() {
     esac
     [ $(( 0x$1 & 0x20 )) -ne 0 ] && echo 1 || echo 0
   }
-  f1=$(sw_of "$r1v"); [ "$f1" = "-" ] && f1=$n1   # 孔1 读不到时沿用目标值（本版不参与 SPI）
+  f1=$(sw_of "$r1v")
+  if [ "$S1_SPI" != "1" ]; then
+    # 孔1 不参与 SPI：唤醒过的这一轮它真的被复位成 OFF 了，不能沿用 STATE 谎报"开"；
+    # 没唤醒则保持原状态，沿用旧值。
+    if [ "$reach" = "0" ]; then f1=0; else f1=$n1; fi
+  fi
+  [ "$f1" = "-" ] && f1=$n1
   f2=$(sw_of "$r2v"); f3=$(sw_of "$r3v")
   [ "$f2" = "-" ] && f2=$n2
   [ "$f3" = "-" ] && f3=$n3
   echo "$f1 $f2 $f3" > $STATE
-  # 快照只带开关状态（计量留空 = 前端显示 "--"）：控制路径要快，
-  # 真读电压电流还要 9 次 SPI 事务，等用户主动刷新时再取。
-  printf '1|%s|||\n2|%s|||\n3|%s|||\n' "$f1" "$f2" "$f3" > $SNAP
+  # 快照必须带计量，不能只写开关。
+  # 网页默认只读快照（不碰 SPI），如果这里把 V/A/W 留空，用户点一次开关后
+  # 三孔计量就会一直显示 "--"，而 status 读到的快照非空又不会自愈 —— 现象就是
+  # "点完开关，电压电流功率全没了"（2026-11-10 真机 bug）。
+  # 此刻芯片已被唤醒、P0 隔离已开，顺手补读几组事务即可，不必再打一次 RST。
+  ov3=$(measure1 3)
+  ov2=$(measure1 2)
+  ov1="||"
+  if [ "$S1_SPI" = "1" ]; then
+    ov1=$(measure1 1)
+    pca_wr 0x01        # 孔1 窗口占用了 SDA，P0 需重开
+  fi
+  printf '1|%s|%s\n2|%s|%s\n3|%s|%s\n' "$f1" "$ov1" "$f2" "$ov2" "$f3" "$ov3" > $SNAP
 
   iso_close
   btn_lock_free
