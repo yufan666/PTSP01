@@ -79,7 +79,16 @@ jobs:
           # feeds 源也走自己的 fork（pinned commit 保持不变，保证可复现）
           sed -i 's#src-git packages https://git.openwrt.org/feed/packages.git#src-git packages https://github.com/yufan666/packages.git#' feeds.conf.default
           sed -i 's#src-git luci https://git.openwrt.org/project/luci.git#src-git luci https://github.com/yufan666/luci.git#' feeds.conf.default
-          echo '--- feeds.conf.default（已指向自己 fork） ---'
+          sed -i 's#src-git routing https://git.openwrt.org/feed/routing.git#src-git routing https://github.com/yufan666/routing.git#' feeds.conf.default
+          sed -i 's#src-git telephony https://git.openwrt.org/feed/telephony.git#src-git telephony https://github.com/yufan666/telephony.git#' feeds.conf.default
+          sed -i 's#src-git video https://github.com/openwrt/video.git#src-git video https://github.com/yufan666/video.git#' feeds.conf.default
+          # 防呆：所有 src-git 源必须已指向 yufan666，否则构建立即失败
+          if grep '^src-git' feeds.conf.default | grep -v 'yufan666' | grep -q .; then
+            echo '::error::feeds.conf.default 仍有非自持源:'
+            grep '^src-git' feeds.conf.default | grep -v 'yufan666'
+            exit 1
+          fi
+          echo '--- feeds.conf.default（已全部指向自己 fork） ---'
           cat feeds.conf.default
 
       - name: Restore downloads cache
