@@ -1,0 +1,33 @@
+# PTSP01 默认无线配置：开机即开 AP 热点
+#
+# 为什么必须内置这个文件：
+#   镜像默认不带 /etc/config/wireless，wpad 没有 radio 可管就不会起来，
+#   板子等于没有 wifi。插排现场经常没网线，热点是最省事的接入入口。
+#
+# SSID / 路径会在首次启动时由 /etc/uci-defaults/99-ptsp01-wifi 校正：
+#   SSID = PTSP01-XXXX（XXXX = 无线 MAC 末 4 位，多台一起上电不撞名）
+#   密码 = ptsp01wifi（WPA2-PSK，板上 uci set 或改本文件即可）
+#
+# path 说明：DTS 里 wmac 挂在 0x18100000（ar9331.dtsi），所以是
+#   platform/ahb/18100000.wmac。不同内核版本节点名偶尔带后缀，
+#   99-ptsp01-wifi 会从 /sys/class/ieee80211/phy0/device 反推后覆盖，
+#   写错也不至于热点起不来。
+
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option path 'platform/ahb/18100000.wmac'
+	option band '2g'
+	option channel '6'
+	option htmode 'HT20'
+	option country 'CN'
+	option legacy_rates '1'
+	option disabled '0'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'PTSP01'
+	option encryption 'psk2'
+	option key 'ptsp01wifi'
+	option wmm '1'

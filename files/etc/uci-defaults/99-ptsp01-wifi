@@ -1,0 +1,49 @@
+#!/bin/sh
+# PTSP01 首次启动：把无线热点配好并默认打开
+#
+# 做三件事：
+#   1) 校正 radio0 的 path —— 直接问 sysfs，别信写死的字符串
+#   2) SSID 追加无线 MAC 末 4 位 —— 多台插排同场不撞名
+#   3) 保证 radio / iface 都是 enabled
+#
+# 放在 99- 前缀末尾：要在 99-ptsp01-mac 之后跑，这样读到的 macaddr
+# 是固定的 C4:CD:45:20:82:57，SSID 后缀才不会每次开机变。
+
+[ -f /etc/config/wireless ] || exit 0
+
+# ath9k 可能是懒加载的，先踢一下再等 phy 出现
+modprobe ath9k 2>/dev/null
+
+i=0
+while [ $i -lt 20 ]; do
+	[ -e /sys/class/ieee80211/phy0 ] && break
+	sleep 1
+	i=$((i + 1))
+done
+
+PHY=/sys/class/ieee80211/phy0
+
+# 1) path 校正：/sys/devices/platform/ahb/18100000.wmac -> platform/ahb/18100000.wmac
+if [ -d "$PHY" ]; then
+	dev=$(readlink -f "$PHY/device" 2>/dev/null)
+	case "$dev" in
+		/sys/devices/?*) uci -q set "wireless.radio0.path=${dev#/sys/devices/}" ;;
+	esac
+	mac=$(cat "$PHY/macaddress" 2>/dev/null)
+fi
+[ -n "$mac" ] || mac=$(uci -q get wireless.radio0.macaddr)
+
+# 2) SSID 后缀：MAC 去掉冒号后取末 4 位
+if [ -n "$mac" ]; then
+	m12=$(printf '%s' "$mac" | tr -d ':' | tr 'A-F' 'a-f')
+	if [ ${#m12} -eq 12 ]; then
+		uci -q set "wireless.default_radio0.ssid=PTSP01-${m12#????????}"
+	fi
+fi
+
+# 3) 默认开启
+uci -q set wireless.radio0.disabled='0'
+uci -q set wireless.default_radio0.disabled='0'
+uci -q commit wireless
+
+exit 0

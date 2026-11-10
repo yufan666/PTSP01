@@ -1,0 +1,39 @@
+# PTSP01 默认网络配置
+#
+# 目标：插上网线就能直接用，不需要再手动
+#   ip link set eth1 master br-lan
+#
+# 本板 AR9331 有 eth0 / eth1 两个 GMAC，都接到板载 AR8216 交换芯片，
+# 而 RJ45 只挂在其中一路（实测是 eth1）。官方 board.d 只把 eth0 放进
+# br-lan，于是电脑插上线拿不到地址、也连不上 192.168.1.1。
+# 这里把 eth0 和 eth1 全部桥进 br-lan，两条路都通。
+
+config interface 'loopback'
+	option device 'lo'
+	option proto 'static'
+	option ipaddr '127.0.0.1'
+	option netmask '255.0.0.0'
+
+config globals 'globals'
+	option ula_prefix 'fd8e:3b4a:1c72::/48'
+	option packet_steering '1'
+
+config device
+	option name 'br-lan'
+	option type 'bridge'
+	list ports 'eth0'
+	list ports 'eth1'
+
+config interface 'lan'
+	option device 'br-lan'
+	option proto 'static'
+	option ipaddr '192.168.1.1'
+	option netmask '255.255.255.0'
+	option ip6assign '60'
+
+# WAN 侧：默认不绑定任何设备（USB 上行由 ptsp01-usbwan.sh 用 ip 命令直接管，
+# 不经过 netifd）。保留这个空接口是为了让 firewall 的 wan 区（NAT）成立，
+# 以及 99-ptsp01-mac 能设定 wan 的 MAC。
+config interface 'wan'
+	option proto 'none'
+	option auto '0'

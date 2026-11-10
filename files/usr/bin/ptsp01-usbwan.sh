@@ -46,6 +46,33 @@ usb_netdevs() {
 ip4_of() { ip -4 -o addr show dev "$1" 2>/dev/null | awk 'NR==1{split($4,a,"/"); print a[1]}'; }
 gw_of()  { ip route show dev "$1" 2>/dev/null | awk '/^default/{print $3; exit}'; }
 
+# ---------- 把 USB 上行接口挂进 firewall 的 wan 区 ----------
+# 这个接口是本脚本手工配地址的（不走 netifd），firewall4 的 zone 按 network
+# 名根本找不到它 —— 不挂进 wan 区就没有 masq，电脑接网口能拿到 IP 却上不了网。
+# 按 device 点名挂进去，NAT 才成立。只在设备变化时 reload 一次。
+FW_DEV=/tmp/ptsp01-usbwan.fwdev
+
+fw_zone_attach() {   # $1 = 接口名
+	[ "$(cat $FW_DEV 2>/dev/null)" = "$1" ] && return 0
+	uci -q get firewall >/dev/null 2>&1 || return 0
+
+	idx=""; i=0
+	while uci -q get "firewall.@zone[$i]" >/dev/null 2>&1; do
+		if [ "$(uci -q get "firewall.@zone[$i].name")" = "wan" ]; then idx=$i; break; fi
+		i=$((i + 1))
+		[ $i -gt 16 ] && break
+	done
+	[ -n "$idx" ] || return 0
+
+	uci -q del_list "firewall.@zone[$idx].device=$1"
+	uci -q add_list "firewall.@zone[$idx].device=$1"
+	uci -q set "firewall.@zone[$idx].masq=1"
+	uci -q commit firewall || return 0
+	echo "$1" > $FW_DEV
+	fw4 reload >/dev/null 2>&1
+	log "已把 $1 挂进 wan 区（NAT 生效）"
+}
+
 ENABLED=$(cfg usbwan);        ENABLED=${ENABLED:-1}
 METRIC=$(cfg usbwan_metric); METRIC=${METRIC:-300}
 FORCE=$(cfg usbwan_iface)
@@ -93,6 +120,7 @@ while :; do
 	fi
 
 	gw=$(gw_of "$ifc")
+	fw_zone_attach "$ifc"     # 先保证 NAT 通路，再对外报 up
 	write_state "$ifc" "$ip4" "$gw" "up"
 	sleep 10
 done
