@@ -113,11 +113,16 @@ jobs:
           set -euo pipefail
           cd openwrt
 
-          echo "===== 1/4 设备树 ====="
+          echo "===== 1/5 设备树 ====="
           cp -v ../dts/ar9331_8dev_carambola2.dts \
                 target/linux/ath79/dts/ar9331_8dev_carambola2.dts
 
-          echo "===== 2/4 内核：打开 /dev/mem ====="
+          echo "===== 2/5 内核补丁：AR9331 I2S 音频驱动 ====="
+          # 交给 OpenWrt 构建系统自动应用（sound/soc/ath79 + Kconfig/Makefile 挂接）
+          cp -v ../audio-port/900-ath79-sound-soc.patch \
+                target/linux/ath79/patches-6.12/
+
+          echo "===== 3/5 内核：打开 /dev/mem ====="
           # 直接从 ath79 的 Makefile 读内核版本号，避免 ls|sort 猜错文件
           KVER=$(sed -n 's/^KERNEL_PATCHVER:=//p' target/linux/ath79/Makefile | tr -d ' \t')
           GENC="target/linux/generic/config-$KVER"
@@ -159,7 +164,7 @@ jobs:
           grep -q '^CONFIG_DEVMEM=y$' "$KCFG" || { echo "!! target 未写入 DEVMEM=y"; exit 1; }
           echo "  ✓ DEVMEM=y 已写入 generic + target + 全部 subtarget"
 
-          echo "===== 3/4 打包进镜像的文件 ====="
+          echo "===== 4/5 打包进镜像的文件 ====="
           mkdir -p files
           if [ -d ../files ]; then
             cp -av ../files/. files/
@@ -167,7 +172,7 @@ jobs:
             echo "  (仓库里没有 files/，跳过)"
           fi
 
-          echo "===== 4/4 生成 .config ====="
+          echo "===== 5/5 生成 .config ====="
           cp ../config/buildroot.config .config
           make defconfig
 

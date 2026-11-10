@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config SND_SOC_ATH79
+	tristate "SoC Audio for the Atheros AR9331 SoC"
+	depends on ATH79
+	select SND_SOC_GENERIC_DMAENGINE_PCM
+	help
+	  Say Y or M if you want to add support for the I2S audio
+	  interface (stereo block + MBOX DMA) of the Atheros AR9331 SoC.
+	  This was originally based on the Qualcomm ath79-stereo BSP
+	  code and franzflasch's ar9331-i2s-alsa Carambola2 driver,
+	  ported to the modern ASoC component API.

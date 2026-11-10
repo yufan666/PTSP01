@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+# ptsp01-web —— 插排控制台 web 服务（busybox httpd，零新增包）
+# 页面: /usr/share/ptsp01/www   接口: /cgi-bin/status /cgi-bin/switch
+
+START=95
+USE_PROCD=1
+
+start_service() {
+    # 确保 CGI 可执行（squashfs/overlay 恢复后兜底）
+    chmod +x /usr/share/ptsp01/www/cgi-bin/* 2>/dev/null
+    chmod +x /usr/lib/ptsp01/pl7223.sh 2>/dev/null
+
+    procd_open_instance
+    procd_set_param command /bin/busybox httpd -f -p 0.0.0.0:80 -h /usr/share/ptsp01/www
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}

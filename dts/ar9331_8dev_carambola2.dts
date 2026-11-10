@@ -16,6 +16,15 @@
 //      PL7223 的隔离使能、片选都挂在这颗扩展器上（原厂 ko 依赖 i2c_master_send/recv）
 //   5. &spi 下新增 spidev@1
 //      给 PL7223 留一个用户态出口；CS0 仍然归 spi-nor（flash）
+//   6. 音频链路（2026-11-10）：AR9331 I2S(0x180b0000) -> WM8988 -> 3.5mm
+//      - pinmux 打开 GPIO_FUNC BIT26(I2S0_EN)/BIT27(MCKEN)/BIT29(I2S_GPIO_18_22_EN)
+//        => SCK=GPIO18 WS=GPIO19 SD=GPIO20 OMCLK=GPIO21 MIC=GPIO22（GPIO18~22 与
+//           PCA9554A(GPIO11/17)、PL7223 CS(GPIO1/26) 无冲突）
+//      - MBOX DMA(0x180a0000) MISC 中断 bit7；复位 0x18060020
+//      - wm8988 挂在现有 i2c-gpio 总线，地址暂按 0x1a（上机后 i2cdetect 校对）
+//      - simple-audio-card：mclk-fs=256，codec 侧固定 sysclk=11289600(44.1k*256)
+//        使 wm8988 在首次 open 前就有 sysclk（否则驱动 startup 直接 -EINVAL），
+//        同时把播放速率锁在 44.1kHz（AirPlay/DLNA 均为此采样率）
 
 #include "ar9331.dtsi"
 
@@ -80,12 +89,68 @@
 			gpio-controller;
 			#gpio-cells = <2>;
 		};
+
+		/* [PTSP01] WM8988 编解码器，I2C 地址待上机 i2cdetect 校对 */
+		wm8988: codec@1a {
+			compatible = "wlf,wm8988";
+			reg = <0x1a>;
+			#sound-dai-cells = <0>;
+		};
+	};
+
+	/*
+	 * [PTSP01] AR9331 I2S 音频（stereo 块 + MBOX DMA）
+	 *
+	 * interrupts = <7>：MISC INT bit7 = DMA（miscintc 由 ath79.dtsi 提供，
+	 * 根节点下需显式声明 interrupt-parent，apb 内的节点才会自动继承）。
+	 * pinctrl-0 打开 GPIO_FUNC 的 I2S 三位；GPIO18~22 的 OE 由驱动 RMW。
+	 */
+	audio_i2s: audio@180b0000 {
+		compatible = "qca,ar9331-i2s";
+		reg = <0x180b0000 0x1c>,	/* stereo */
+		      <0x180a0000 0x6c>,	/* MBOX DMA */
+		      <0x18060020 0x4>,		/* RST_RESET_MBOX */
+		      <0x18040000 0x28>;	/* GPIO OE */
+		reg-names = "stereo", "dma", "reset", "gpio";
+
+		interrupt-parent = <&miscintc>;
+		interrupts = <7>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&i2s_enable_pins>;
+
+		status = "okay";
+	};
+
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "PTSP01-Audio";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,mclk-fs = <256>;
+		simple-audio-card,bitclock-master = <&sound_cpu>;
+		simple-audio-card,frame-master = <&sound_cpu>;
+
+		sound_cpu: simple-audio-card,cpu {
+			sound-dai = <&audio_i2s>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&wm8988>;
+			system-clock-frequency = <11289600>;	/* 44.1k * 256 */
+		};
 	};
 };
 
 &ref {
 	/* [PTSP01] 本板晶振 25MHz（carambola2 官方设计是 40MHz） */
 	clock-frequency = <25000000>;
+};
+
+/* [PTSP01] I2S 引脚复用：GPIO_FUNC(0x18040028) BIT26/27/29 置 1 */
+&pinmux {
+	i2s_enable_pins: pinmux_i2s_enable_pins {
+		pinctrl-single,bits = <0x0 0x2c000000 0x2c000000>;
+	};
 };
 
 &usb {
