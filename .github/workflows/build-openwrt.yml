@@ -165,7 +165,7 @@ jobs:
           echo "  ✓ DEVMEM=y 已写入 generic + target + 全部 subtarget"
 
           # WM8988 依赖链自检（kernel-extra.config 第二段）
-          for sym in CONFIG_I2C CONFIG_SND_SOC CONFIG_SND_SOC_WM8988; do
+          for sym in CONFIG_I2C CONFIG_SND_SOC CONFIG_SND_SOC_WM8988 CONFIG_SND_SOC_I2C_AND_SPI; do
             grep -q "^${sym}=m$" "$GENC" || { echo "!! generic 未写入 ${sym}=m"; exit 1; }
             grep -q "^${sym}=m$" "$KCFG" || { echo "!! target 未写入 ${sym}=m"; exit 1; }
           done
@@ -311,6 +311,18 @@ jobs:
             echo "::endgroup::"
             echo "::group::错误行检索"
             grep -n -iE "error|Error [0-9]|failed|No space|Killed|undefined reference" build.log | tail -n 60 || true
+            echo "::endgroup::"
+            echo "::group::内核配置四层追踪（I2C/SND 链路）"
+            KDIR=$(ls -d build_dir/target-*/linux-*/linux-*/ 2>/dev/null | head -1)
+            echo "KDIR=$KDIR"
+            for f in .config.target .config.override .config.set .config; do
+              P="${KDIR}${f}"
+              [ -f "$P" ] || { echo "--- $f (不存在)"; continue; }
+              echo "--- $f 关键符号 ---"
+              grep -E '^#?[[:space:]]*CONFIG_(I2C|I2C_CHARDEV|I2C_GPIO|SND|SND_SOC|SND_SOC_ATH79|SND_SOC_WM8988|SND_SOC_I2C_AND_SPI|SND_SIMPLE_CARD|SPI_MASTER)[= ]' "$P" || echo "  (无匹配行)"
+            done
+            echo "--- 顶层 .config 中 KERNEL_I2C/KERNEL_SND ---"
+            grep -E 'CONFIG_KERNEL_(I2C|SND)' .config || echo "  (无)"
             echo "::endgroup::"
             echo "::group::用 V=s 重跑 package/kernel/linux 取真实错误"
             make package/kernel/linux/compile V=s -j1 2>&1 | tail -n 300 || true
