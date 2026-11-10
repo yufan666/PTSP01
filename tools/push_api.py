@@ -62,8 +62,10 @@ def main():
     remote = api('GET', 'https://api.github.com/repos/%s/commits/main' % REPO)['sha']
     print('remote main:', remote[:12])
 
+    # 远端 commit 由 API 创建，本地对象库可能没有；可用第二个参数指定本地基线
+    base = sys.argv[2] if len(sys.argv) > 2 else remote
     diff = subprocess.check_output(
-        ['git', 'diff', '--name-status', remote, 'HEAD']).decode(errors='replace')
+        ['git', 'diff', '--name-status', base, 'HEAD']).decode(errors='replace')
     files, deleted = [], []
     for ln in diff.splitlines():
         parts = ln.split('\t')
