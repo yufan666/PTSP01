@@ -155,23 +155,28 @@ rewrite_states() {
   fi
 }
 
-# ---------- 换算（原厂 pl7223_calcuate_value：u48 大端 / 2^n） ----------
+# ---------- 换算（原厂 pl7223_calcuate_value：u48 小端 / 2^n） ----------
 # conv <hex串> <shift> → 4 位小数
-# ⚠ spi_rx 已经把字节间空格 tr 掉了（"830800380000"），所以旧实现里的
-#   `for(i=1;i<=NF;i++) v=v*256+$i` 拿到的是一个 12 字符的整串，
-#   awk 按十进制去转它 → 值完全错，大数还会算出 inf。
-#   改为逐字符按 16 进制累加成浮点：u48 只有 48 位，double 的 53 位尾数装得下，
-#   不丢精度，也不依赖 shell 的整数宽度（ar9331 是 32 位 MIPS）。
+# ⚠ 两个坑都在这一行里（2026-11-10 真机踩实）：
+#  1) 字节序是**小端**，末字节才是 MSB。按大端算会把 224V 算成 3400 万伏，
+#     再被量程检查一挡，网页上就只剩 "--"。实测 `830800380000` → 0x000038000883
+#     ÷ 2^22 = 224.0V ✓（11-09 的 cs7 实测表也是小端）。
+#  2) spi_rx 已把字节间空格 tr 掉，进来的是一个 12 字符整串。旧实现
+#     `for(i=1;i<=NF;i++) v=v*256+$i` 对整串做十进制转换 → 值完全错，大数还出 inf。
+# 所以改为逐字符取 nibble、从串尾往前按 2 位一组累加。u48 只有 48 位，
+# double 的 53 位尾数装得下，不丢精度，也不依赖 shell 的整数宽度（ar9331 是 32 位 MIPS）。
 conv() {
   printf '%s' "$1" | awk -v s="$2" '
     { gsub(/[ \t\r\n]/, ""); h = tolower($0) }
     END {
-      if (length(h) == 0) { print "0.0000"; exit }
+      L = length(h)
+      if (L != 12) { print "0.0000"; exit }     # 不是 6 字节 = 读取失败
       n = 0
-      for (i = 1; i <= length(h); i++) {
-        d = index("0123456789abcdef", substr(h, i, 1)) - 1
-        if (d < 0) { print "0.0000"; exit }     # 非 hex = 读取失败
-        n = n * 16 + d
+      for (i = L - 2; i >= 0; i -= 2) {         # 从末字节（MSB）开始往前
+        d1 = index("0123456789abcdef", substr(h, i + 1, 1)) - 1
+        d2 = index("0123456789abcdef", substr(h, i + 2, 1)) - 1
+        if (d1 < 0 || d2 < 0) { print "0.0000"; exit }
+        n = n * 256 + (d1 * 16 + d2)
       }
       printf "%.4f", n / (2 ^ s)
     }'
@@ -200,10 +205,16 @@ spid_of() { case "$1" in 1) echo $SPID1;; 2) echo $SPID2;; 3) echo $SPID3;; esac
 # 调用方负责持锁与 iso（P0）状态；孔1 的 CS 窗口在本函数内部自管。
 measure1() {   # $1=孔号
   d=$(spid_of "$1")
+  pca_wr 0x01        # 每孔重新使能隔离：连续多轮事务后 P0 会掉，掉了就读回全 0
   [ "$1" = "1" ] && cs17_lo
   uv=$(rd_mode3 "$d" "w70,00"); iv=$(rd_mode3 "$d" "w70,06"); pv=$(rd_mode3 "$d" "w70,78")
   [ "$1" = "1" ] && cs17_hi
   calc3 "$uv" "$iv" "$pv"
+}
+
+# 从旧快照里取某孔的计量列（"v|a|w"，没有则 "||"）
+old_meas() {   # $1=孔号
+  awk -F'|' -v n="$1" '$1 == n { printf "%s|%s|%s\n", $3, $4, $5 }' $SNAP 2>/dev/null
 }
 
 # ---------- 上层编排（网页 CGI / MQTT 守护共用，单一事实来源） ----------
@@ -372,6 +383,10 @@ do_switch() {
   # 此刻芯片已被唤醒、P0 隔离已开，顺手补读几组事务即可，不必再打一次 RST。
   ov3=$(measure1 3)
   ov2=$(measure1 2)
+  [ "$ov3" = "||" ] && ov3=$(old_meas 3)   # 现读失败就沿用旧值，绝不写空
+  [ "$ov2" = "||" ] && ov2=$(old_meas 2)
+  [ -n "$ov3" ] || ov3="||"
+  [ -n "$ov2" ] || ov2="||"
   ov1="||"
   if [ "$S1_SPI" = "1" ]; then
     ov1=$(measure1 1)
