@@ -1,3 +1,5 @@
-audio-port/token.txt
-audio-port/soundmk_put.json
-audio-port/patch-work/
+token.txt
+soundmk_put.json
+newcommit.txt
+patch-work/
+ar9331-i2s-alsa.tar.gz

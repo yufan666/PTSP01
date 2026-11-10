@@ -45,6 +45,19 @@
   .total .n{font-size:22px;font-weight:700;color:var(--amber);font-variant-numeric:tabular-nums}
   .total .u{font-size:12px;color:var(--dim);margin-left:4px}
   .err{color:var(--red);font-size:12px;margin-top:10px;display:none}
+  .usb{margin-top:16px;background:var(--card);border:1px solid var(--line);
+    border-radius:12px;padding:16px 18px}
+  .usb h2{font-size:12px;font-weight:600;color:var(--dim);margin-bottom:8px;
+    letter-spacing:.08em}
+  .urow{display:flex;justify-content:space-between;gap:12px;padding:7px 0;
+    border-top:1px solid rgba(255,255,255,.04);font-size:13px}
+  .urow:first-of-type{border-top:0}
+  .urow .k{color:var(--dim);flex:0 0 64px}
+  .urow .v{flex:1;text-align:right;font-variant-numeric:tabular-nums;word-break:break-all}
+  .badge{font-size:11px;padding:2px 8px;border-radius:999px;
+    background:rgba(255,255,255,.08);color:var(--dim)}
+  .badge.on{background:rgba(62,207,110,.15);color:var(--green)}
+  .badge.off{background:rgba(239,83,80,.15);color:var(--red)}
   footer{margin-top:18px;font-size:11px;color:var(--dim);text-align:center}
   #toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);
     background:#22283a;color:var(--txt);padding:10px 18px;border-radius:8px;
@@ -63,6 +76,14 @@
   <div class="total">
     <span style="color:var(--dim);font-size:13px">三孔总功率</span>
     <span><span class="n" id="tw">--</span><span class="u">W</span></span>
+  </div>
+
+  <div class="usb">
+    <h2>USB</h2>
+    <div class="urow"><span class="k">上行</span><span class="v" id="usb-wan">--</span></div>
+    <div class="urow"><span class="k">存储</span><span class="v" id="usb-store">--</span></div>
+    <div class="urow"><span class="k">串口</span><span class="v" id="usb-serial">--</span></div>
+    <div class="urow"><span class="k">设备</span><span class="v" id="usb-dev">--</span></div>
   </div>
 
   <div class="err" id="err">读取失败：设备通信异常，将自动重试</div>
@@ -105,7 +126,35 @@ function render(d){
   document.getElementById('tw').textContent = tw;
   document.getElementById('err').style.display = (d && d.ok) ? 'none' : 'block';
   document.getElementById('upd').textContent = new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  renderUsb(d && d.usb);
   countdown = 10;
+}
+
+const USB_STATE = {
+  'up':'已联网', 'no-device':'无设备', 'no-carrier':'无链路',
+  'no-ip':'未取到地址', 'disabled':'已关闭'
+};
+
+function renderUsb(u){
+  const w = (u && u.wan) || {};
+  const st = w.state || 'unknown';
+  const cls = (st === 'up') ? 'on' : ((st === 'no-device' || st === 'unknown') ? '' : 'off');
+  document.getElementById('usb-wan').innerHTML =
+    `<span class="badge ${cls}">${USB_STATE[st] || st}</span>` +
+    (w.ip ? '&nbsp; ' + w.iface + ' · ' + w.ip : '');
+
+  const store = (u && u.storage) || [];
+  document.getElementById('usb-store').innerHTML = store.length
+    ? store.map(s => `${s.mnt} · ${s.fs} · ${(s.size_kb/1048576).toFixed(1)}G / 用 ${(s.used_kb/1048576).toFixed(1)}G`).join('<br>')
+    : '--';
+
+  const ser = (u && u.serial) || [];
+  document.getElementById('usb-serial').innerHTML = ser.length
+    ? ser.map(s => `${s.dev} (${s.driver})`).join('<br>') : '--';
+
+  const dev = (u && u.devices) || [];
+  document.getElementById('usb-dev').innerHTML = dev.length
+    ? dev.map(x => `${x.id}${x.name ? ' · ' + x.name : ''}`).join('<br>') : '--';
 }
 
 async function refresh(){

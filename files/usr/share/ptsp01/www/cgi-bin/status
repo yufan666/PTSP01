@@ -22,4 +22,8 @@ JSON=$(read_all_raw | awk -F'|' '
   END { printf "[%s]|%.2f", out, total }
 ')
 
-echo '{"ok":true,"sockets":'"${JSON%%|*}"',"total_w":'${JSON##*|}'}'
+# USB 子系统状态（USB 上行 / U盘挂载 / 串口 / 设备清单）
+USB=$(/usr/bin/ptsp01-usb.sh status 2>/dev/null)
+[ -n "$USB" ] || USB='{"wan":{"iface":"","ip":"","gw":"","state":"unknown"},"storage":[],"serial":[],"devices":[]}'
+
+echo '{"ok":true,"sockets":'"${JSON%%|*}"',"total_w":'${JSON##*|}',"usb":'"$USB"'}'
