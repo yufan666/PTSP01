@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+# ptsp01-web —— 插排控制台 web 服务看护
+#   页面根：/www（uhttpd 默认 home，文件由 files/www 直接落位）
+#   CGI：  /www/cgi-bin/{status,switch}（uhttpd 对 cgi_prefix 下的可执行文件直接当 CGI 跑）
+#
+# 这里不自己起服务，只做两件事：
+#   1) 兜底补执行位（squashfs/overlay 恢复后可能丢）
+#   2) uhttpd 没在跑时把它拉起来（避免与 uhttpd 自带 init 抢 80 端口）
+
+START=95
+STOP=10
+
+start() {
+	chmod 755 /www/cgi-bin/* 2>/dev/null
+	chmod 755 /usr/lib/ptsp01/pl7223.sh 2>/dev/null
+
+	[ -x /usr/sbin/uhttpd ] || {
+		echo "ptsp01-web: uhttpd 不在镜像里，控制台不可用" >&2
+		return 0
+	}
+
+	/etc/init.d/uhttpd enabled || /etc/init.d/uhttpd enable
+	/etc/init.d/uhttpd running || /etc/init.d/uhttpd start
+}
+
+stop() {
+	# 不主动停 uhttpd：它可能还被别的页面使用
+	return 0
+}

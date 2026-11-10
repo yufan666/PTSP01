@@ -1,0 +1,20 @@
+#!/bin/sh
+# 首次启动补齐 USB 相关配置项（幂等，可重复执行；老配置升级时也会补上）
+#
+#   usbwan         1      USB 上行守护开关
+#   usbwan_metric  300    备份默认路由 metric（0 = 只取地址不碰路由）
+#   usbwan_iface   ''     强制接口名（留空自动探测）
+
+[ -f /etc/config/ptsp01 ] || touch /etc/config/ptsp01
+uci -q get ptsp01.main >/dev/null 2>&1 || uci set ptsp01.main=main
+
+add_opt() {  # $1=key $2=default
+	uci -q get "ptsp01.main.$1" >/dev/null 2>&1 || uci set "ptsp01.main.$1=$2"
+}
+
+add_opt usbwan 1
+add_opt usbwan_metric 300
+add_opt usbwan_iface ''
+
+uci commit ptsp01
+exit 0

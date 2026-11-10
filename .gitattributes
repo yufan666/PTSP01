@@ -16,3 +16,4 @@ files/usr/bin/pl7223bb -text
 # kernel/patch 等注入 CI 的文件必须 LF
 config/** text eol=lf
 dts/** text eol=lf
+files/www/** text eol=lf

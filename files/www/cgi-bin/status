@@ -1,0 +1,45 @@
+#!/bin/sh
+# status —— GET /cgi-bin/status[?live=1]
+#
+# 默认走 /tmp/socket_data 快照：毫秒级返回，**不碰 SPI**。
+# 为什么不能每次轮询都真读：芯片的 CS 在事务结束后被拉高就会睡，
+# 必须打 RST 脉冲（GPIO14 拉高 1s）才能唤醒；而 RST 会把三颗 PL7223 的
+# 0x380F 全部复位成 00，也就是**继电器会断开**。实测 20→00。
+# 所以「10 秒轮询」若真读，插排就会每 10 秒断一次电。
+# 只有用户点开关（switch CGI）或显式 ?live=1 时才真操作硬件。
+
+printf 'Content-Type: application/json\r\n\r\n'
+
+. /usr/lib/ptsp01/pl7223.sh
+
+case "$QUERY_STRING" in
+  *live=1*) DATA=$(read_all_raw) ;;
+  *)        DATA=$(cat $SNAP 2>/dev/null) ;;
+esac
+
+# 快照缺失（刚开机）→ 真读一次并落盘
+if [ -z "$DATA" ]; then
+  DATA=$(read_all_raw)
+fi
+[ -n "$DATA" ] || DATA=$(printf '1|||\n2|||\n3|||')
+
+JSON=$(printf '%s\n' "$DATA" | awk -F'|' '
+  BEGIN { total = 0; out = "" }
+  {
+    on  = ($2 == "1") ? "true" : "false"
+    err = ($3 == "") ? "true" : "false"
+    v = ($3 == "") ? "null" : $3
+    a = ($4 == "") ? "null" : $4
+    w = ($5 == "") ? "null" : $5
+    seg = sprintf("{\"id\":%s,\"on\":%s,\"err\":%s,\"v\":%s,\"a\":%s,\"w\":%s}", $1, on, err, v, a, w)
+    out = out (NR > 1 ? "," : "") seg
+    if ($3 != "") total += $5
+  }
+  END { printf "[%s]|%.2f", out, total }
+')
+
+# USB 子系统状态（USB 上行 / U盘挂载 / 串口 / 设备清单）
+USB=$(/usr/bin/ptsp01-usb.sh status 2>/dev/null)
+[ -n "$USB" ] || USB='{"wan":{"iface":"","ip":"","gw":"","state":"unknown"},"storage":[],"serial":[],"devices":[]}'
+
+echo '{"ok":true,"sockets":'"${JSON%%|*}"',"total_w":'"${JSON##*|}"',"usb":'"$USB"'}'

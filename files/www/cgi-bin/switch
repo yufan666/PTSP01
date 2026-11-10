@@ -26,6 +26,9 @@ if [ "$ST" = "toggle" ]; then
 fi
 
 R=$(do_switch "$ID" "$ST") || { echo '{"ok":false,"err":"busy"}'; exit 0; }
+# R = "f1 f2 f3"；孔1 本版不参与 SPI，回读可能是 "-"，必须转成 null 才是合法 JSON
 f1=${R%% *}; rest=${R#* }; f2=${rest%% *}; f3=${rest#* }
+jv() { case "$1" in 0|1) echo "$1";; *) echo "null";; esac; }
+J1=$(jv "$f1"); J2=$(jv "$f2"); J3=$(jv "$f3")
 
-echo '{"ok":true,"readback":['"$f1,$f2,$f3"'],"states":{"1":'$f1',"2":'$f2',"3":'$f3'}}'
+echo '{"ok":true,"readback":['"$J1,$J2,$J3"'],"states":{"1":'"$J1"',"2":'"$J2"',"3":'"$J3"'}}'

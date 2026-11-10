@@ -1,0 +1,12 @@
+#!/bin/sh
+# 首次启动：把 uhttpd 固定成控制台布局（幂等，可重复执行）
+[ -x /usr/sbin/uhttpd ] || exit 0
+
+uci -q get uhttpd.main >/dev/null 2>&1 || uci set uhttpd.main=uhttpd
+uci -q set uhttpd.main.home='/www'
+uci -q set uhttpd.main.cgi_prefix='/cgi-bin'
+uci -q commit uhttpd
+
+/etc/init.d/uhttpd enable
+/etc/init.d/uhttpd restart
+exit 0
