@@ -76,6 +76,11 @@ jobs:
             https://github.com/yufan666/openwrt.git openwrt
           cd openwrt
           git log -1 --format='构建基线: %H  %s'
+          # feeds 源也走自己的 fork（pinned commit 保持不变，保证可复现）
+          sed -i 's#src-git packages https://git.openwrt.org/feed/packages.git#src-git packages https://github.com/yufan666/packages.git#' feeds.conf.default
+          sed -i 's#src-git luci https://git.openwrt.org/project/luci.git#src-git luci https://github.com/yufan666/luci.git#' feeds.conf.default
+          echo '--- feeds.conf.default（已指向自己 fork） ---'
+          cat feeds.conf.default
 
       - name: Restore downloads cache
         uses: actions/cache@v4
