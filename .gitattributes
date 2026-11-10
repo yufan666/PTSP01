@@ -1,7 +1,17 @@
 # 设备端文件必须 LF（busybox ash 不认 CRLF）
-files/** text eol=lf
-files/** -text
+# 教训：之前写了 "files/** text eol=lf" 又跟了一行 "files/** -text"，
+#       后者把归一化关掉了 —— 无扩展名的 CGI / init.d / uci-defaults
+#       一旦在 Windows 上被编辑就可能带 \r 进镜像。这里逐类显式声明。
 *.sh text eol=lf
+files/etc/** text eol=lf
+files/usr/lib/** text eol=lf
+files/usr/share/** text eol=lf
+
+# 预编译的 MIPS 二进制，不能当文本处理
+files/usr/bin/devmem -text
+files/usr/bin/spitest -text
+files/usr/bin/pl7223bb -text
+
 # kernel/patch 等注入 CI 的文件必须 LF
 config/** text eol=lf
 dts/** text eol=lf

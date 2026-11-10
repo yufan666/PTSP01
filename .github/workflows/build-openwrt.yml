@@ -163,11 +163,26 @@ jobs:
           mkdir -p files
           if [ -d ../files ]; then
             cp -av ../files/. files/
+            # 兜底：Git 在 Windows 上容易丢掉可执行位（实测全变 644），
+            # init.d / CGI / 自研工具在板子上就无法执行。这里统一补回 755。
+            find files/etc/init.d files/etc/uci-defaults files/usr/bin \
+                 files/usr/lib/ptsp01 files/usr/share/ptsp01/www/cgi-bin \
+                 -type f -exec chmod 755 {} + 2>/dev/null || true
           else
             echo "  (仓库里没有 files/，跳过)"
           fi
 
-          echo "===== 4/4 生成 .config ====="
+          echo "===== 4/5 安装 feeds（必须在 defconfig 之前）====="
+          # 坑 5（run 42742230643 的隐患，真机才发现）：
+          #   `make defconfig` 只保留「kconfig 里已存在」的 CONFIG_PACKAGE_* 符号。
+          #   不先装 feeds，packages 源里的 i2c-tools / mosquitto-client-nossl
+          #   这些符号根本不存在 —— defconfig 会把它们静默丢掉，不报错，
+          #   最后镜像的 manifest 里查无此包，MQTT 守护启动时 mosquitto_pub 不存在。
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "  feeds 已安装，包定义数: $(find package/feeds -maxdepth 3 -name Makefile 2>/dev/null | wc -l)"
+
+          echo "===== 5/5 生成 .config ====="
           cp ../config/buildroot.config .config
           make defconfig
 
@@ -191,6 +206,18 @@ jobs:
             echo "  (buildroot 层原本无 KERNEL_DEVMEM 行，直接追加 y)"
           fi
           make defconfig
+
+          # 自检：buildroot.config 里点名的包，必须真的落在 .config 里。
+          # 只要有一项不在，就当场报错，不要白跑 40 分钟再拿到一个缺包的镜像。
+          MISSING=""
+          for sym in $(grep -E '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y$' ../config/buildroot.config | cut -d= -f1); do
+            grep -qE "^${sym}=(y|m)$" .config || MISSING="$MISSING ${sym#CONFIG_PACKAGE_}"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::下列包被 defconfig 丢弃:${MISSING}（feeds 未装，或包名写错）"
+            exit 1
+          fi
+          echo "  ✓ buildroot.config 里的包全部落地"
 
           enable_pkg() {
             # 等价于旧版 ./scripts/config -e（那个写法在 OpenWrt 里是目录，跑不了）
