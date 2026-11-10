@@ -25,50 +25,74 @@ SNAP=/tmp/socket_data      # status CGI 的快照（"n|on|v|a|w" 三行），网
 LOCK=/tmp/btn_busy
 WEBLOCK=/tmp/web_lock
 
-SPID1=/dev/spidev0.3   # 孔1（GPIO17）
-SPID2=/dev/spidev0.2   # 孔2（GPIO1）
-SPID3=/dev/spidev0.1   # 孔3（GPIO26）
+SPID1=/dev/spidev0.3   # 孔1（片选 = PCA9554A P1，内核 spidev 事务自动拉）
+SPID2=/dev/spidev0.2   # 孔2（CS=GPIO1）
+SPID3=/dev/spidev0.1   # 孔3（CS=GPIO26）
 
-# 孔1 是否允许走 SPI 事务（默认关）。
-# 原因（2026-11-10 真机实测）：当前 DTS 把 spidev0.3 的片选指到 PCA9554 P1，
-# 内核每次事务都要经 i2c 写 P1；而孔1 真正的片选是 GPIO17，它同时是 i2c 的 SDA
-# —— GPIO17 一拉低，i2c 立刻死，内核 gpiod 操作超时，连带 PCA 的 P0（隔离使能）
-# 一起丢，于是后面的孔全部读不到。实测：不碰孔1 时孔2/孔3 读写完全正常；
-# 一旦插入孔1 事务，三孔全部返回 0。
-# 修复后（DTS 把 cs-gpios[3] 改成 <0>，让内核只写无引脚的 IOC bit19）再置 1。
-S1_SPI=${PTSP01_S1_SPI:-0}
+# 孔1 是否参与 SPI 事务（默认开）。
+#
+# 2026-11-10 真机定论 —— 推翻了当天早些时候"孔1 片选是 GPIO17"的判断：
+#   孔1 的片选就是 PCA9554A 的 **P1**，DTS 里 cs-gpios[3] 已经这么配，
+#   内核每次 spidev0.3 事务会自动拉它，不需要（也不能）用 GPIO17 手动拉。
+#   GPIO17 只是 i2c 的 SDA，"CS1=17" 是原厂驱动指"用 GPIO17 上的 i2c 去访问
+#   扩展器"的意思。
+#
+#   之前孔1 读不到的真凶：我们用位带直接写 PCA 输出寄存器把隔离使能 P0 置 1，
+#   而 gpio-pca953x 驱动**自己的缓存里 P0 还是 0**。紧接着内核为了拉片选 P1
+#   要写整个输出字节，按缓存值写回 0x02 → P0 被清 0 → 隔离门关闭 → 三个孔
+#   MISO 全 0（实测 out_reg：P0=1 时 0x01，一次 spitest 后变 0x02/0x03）。
+#   而手动拉低 GPIO17 更糟：i2c 的 SDA 直接死，驱动连 P1 都写不进去。
+#
+#   解法：P0 不再位带写，改成把 PCA 的 P0 export 到 sysfs 交给驱动赋值，
+#   驱动缓存与硬件一致后，它拉 P1 时会自动保住 P0=1。
+#   真机验证：孔1 ID=04、U 229.9~230.7V、I 0.155A、P 4.3~4.5W，
+#            开关写 0x20/0x00 回读 20/00，双向正确。
+S1_SPI=${PTSP01_S1_SPI:-1}
 
 ensure_state() { [ -f $STATE ] || echo "0 0 0" > $STATE; }
 
-# ---------- GPIO OE/OUT 位带（孔1 CS=GPIO17 与 孔2/3 CS） ----------
-# 注意：自研 /usr/bin/devmem 读**和写**都会打印 "0xADDR = 0xVAL (DEC)"，
-# 写操作必须重定向，否则输出会污染调用方（CGI/MQTT 的 JSON 直接崩）
-getv() { v=$(devmem $1 2>/dev/null); v=${v#*= }; v=${v%% *}; printf '%s\n' "$v"; }
-wrm() { devmem "$1" 32 "$2" >/dev/null 2>&1; }
-cs17_hi() { v=$(getv $OE); m=$(( -1 - 0x20000 )); wrm $OE $(( $v & $m )); }
-cs17_lo() { v=$(getv $OE); wrm $OE $(( $v | 0x20000 )); }
-c23_lo() { v=$(getv $OUTR); m1=$(( -1 - 0x2 )); m2=$(( -1 - 0x4000000 )); wrm $OUTR $(( $v & $m1 & $m2 )); }
-c23_hi() { v=$(getv $OUTR); wrm $OUTR $(( $v | 0x2 | 0x4000000 )); }
+# ---------- SPI 隔离使能（PCA9554A 的 P0） ----------
+# 这是唯一还需要碰扩展器的地方。**必须经 sysfs 让驱动去写**，不能位带直写寄存器：
+# 位带会绕过 gpio-pca953x 的输出缓存，之后内核为拉片选 P1 而写整个输出字节时，
+# 按缓存回写就把 P0 清 0 —— 隔离门关闭，三孔 MISO 全 0（2026-11-10 真机实测）。
+# 走 sysfs 后驱动缓存与硬件一致，它拉 P1 时会自动保住 P0=1。
+PCA_BASE=""
+PCA_P0V=""
+pca_setup() {
+  if [ -n "$PCA_P0V" ] && [ -w "$PCA_P0V" ]; then
+    echo out > "${PCA_P0V%/value}/direction" 2>/dev/null
+    return 0
+  fi
+  for c in /sys/class/gpio/gpiochip*; do
+    case "$(cat "$c/label" 2>/dev/null)" in
+      *-0038) PCA_BASE=$(( $(cat "$c/base") )); break ;;
+    esac
+  done
+  [ -n "$PCA_BASE" ] || return 1
+  if [ ! -d /sys/class/gpio/gpio$PCA_BASE ]; then
+    echo $PCA_BASE > /sys/class/gpio/export 2>/dev/null
+    sleep 1
+  fi
+  echo out > /sys/class/gpio/gpio$PCA_BASE/direction 2>/dev/null
+  PCA_P0V=/sys/class/gpio/gpio$PCA_BASE/value
+  [ -w "$PCA_P0V" ]
+}
 
-# ---------- raw i2c 位带写 PCA9554A（SCL=GPIO11 SDA=GPIO17） ----------
-oeinit() { v=$(getv $OE); wrm $OE $(( $v | 0x20800 )); }
-sclahi() { v=$(getv $OUTR); wrm $OUTR $(( $v | 0x800 )); }
-sclalo() { v=$(getv $OUTR); m=$(( -1 - 0x800 )); wrm $OUTR $(( $v & $m )); }
-sdahi_o() { v=$(getv $OE); m=$(( -1 - 0x20000 )); wrm $OE $(( $v & $m )); }
-sdalo() { v=$(getv $OE); wrm $OE $(( $v | 0x20000 )); }
-i2c_start() { sclahi; sdahi_o; sdalo; sclalo; }
-i2c_stop() { sclalo; sdalo; sclahi; sdahi_o; }
-i2c_bit() { if [ $1 -eq 1 ]; then sdahi_o; else sdalo; fi; sclahi; sclalo; }
-i2c_ack() { sdahi_o; sclahi; sclalo; sdalo; }
-i2c_byte() { b=$1; k=7; while [ $k -ge 0 ]; do i2c_bit $(( (b >> k) & 1 )); k=$(( k - 1 )); done; i2c_ack; }
-pca_wr() { i2c_start; i2c_byte 0x70; i2c_byte 0x01; i2c_byte $1; i2c_stop; }
+# pca_wr <01|02> —— 只表达"隔离开 / 隔离关"，不碰 P1..P7（P1 是孔1 片选）
+pca_wr() {
+  pca_setup || return 1
+  case "$1" in
+    01|1|0x01) echo 1 > "$PCA_P0V" ;;
+    *)         echo 0 > "$PCA_P0V" ;;
+  esac
+}
 
 # ---------- 环境与锁 ----------
 prep_env() {
   [ -d /sys/class/gpio/gpio526 ] || echo 526 > /sys/class/gpio/export
   echo out > /sys/class/gpio/gpio526/direction
   echo 0 > $RSTV
-  oeinit
+  pca_setup
 }
 
 # ⚠ busybox 的 sleep 只吃整数（`sleep 0.2` 会打 "invalid number" 并立刻返回），
@@ -97,19 +121,17 @@ btn_lock_take() {   # 等 btn_guard 本轮 i2c 采样结束后占据危险区
 btn_lock_free() { rm -f $LOCK; }
 
 # ---------- 隔离与唤醒 ----------
-iso_open()  { cs17_hi; pca_wr 0x01; }   # P0=1 打开隔离路径（GPIO17 须为高）
-iso_close() { cs17_hi; pca_wr 0x02; }   # P0=0 关闭
+iso_open()  { pca_wr 0x01; }   # P0=1 放行 SPI 隔离门（孔1 的 CS 由内核管，别再碰 GPIO17）
+iso_close() { pca_wr 0x02; }   # P0=0 隔离三孔
 
-# 联合唤醒：P0=1 → 三CS全低 → RST 脉冲 → 释放孔2/3 CS
-# 副作用：三孔 0x380F 全部复位为 OFF，调用后必须 rewrite_states
+# 联合唤醒：P0=1 → RST 脉冲。
+# 片选全部交给内核 spidev 事务（cs-gpios: P1/GPIO1/GPIO26），这里不手动拉，
+# 否则 GP1(P1)/GPIO17(SDA) 会和内核抢线。
+# 副作用：三孔 0x380F 全部复位，调用后必须 rewrite_states
 wake_all() {
-  cs17_hi
   pca_wr 0x01
-  cs17_lo
-  c23_lo
   echo 1 > $RSTV; sleep 1
   echo 0 > $RSTV; sleep 1
-  c23_hi
 }
 
 # ---------- SPI 事务（spidev，125kHz） ----------
@@ -149,16 +171,13 @@ wr_sw() {   # $1=dev $2=0|1
   spitest "$1" 125000 "wB8,0F,$d" > /dev/null 2>&1
 }
 
-# 按状态文件重写三孔（唤醒后必调）；顺序 孔3→孔2→孔1（GPIO17 窗口最短）
+# 按状态文件重写三孔（唤醒后必调）；顺序 孔3→孔2→孔1
 rewrite_states() {
   ensure_state
   read s1 s2 s3 < $STATE
   wr_sw "$SPID3" "$s3"
   wr_sw "$SPID2" "$s2"
-  if [ "$S1_SPI" = "1" ]; then
-    cs17_lo; wr_sw "$SPID1" "$s1"; cs17_hi
-    pca_wr 0x01
-  fi
+  [ "$S1_SPI" = "1" ] && wr_sw "$SPID1" "$s1"
 }
 
 # ---------- 换算（原厂 pl7223_calcuate_value：u48 小端 / 2^n） ----------
@@ -221,9 +240,7 @@ spid_of() { case "$1" in 1) echo $SPID1;; 2) echo $SPID2;; 3) echo $SPID3;; esac
 # 调用方负责持锁与 iso（P0）状态；孔1 的 CS 窗口在本函数内部自管。
 measure1() {   # $1=孔号
   d=$(spid_of "$1")
-  [ "$1" = "1" ] && cs17_lo
   calc3 "$(rd_u "$d")" "$(rd_i "$d")" "$(rd_p "$d")"
-  [ "$1" = "1" ] && cs17_hi
 }
 
 # 一个完整的「RST + 读某孔计量」：这是唯一能拿到真实 V/A/W 的路径。
@@ -334,25 +351,23 @@ do_switch() {
   echo "$n1 $n2 $n3" > $STATE
   wake_all              # RST → 三孔复位为闭合(00)
   rewrite_states        # 按目标状态写：开=00、关=20
-  cs17_hi
   pca_wr 0x01
 
   # 回读校验（写入已修复 r1 问题，回读值可信；极性反：bit5=0 才是 ON）
   f3=$(sw_of "$(rd_sw "$SPID3")"); [ "$f3" = "-" ] && f3=$n3
   f2=$(sw_of "$(rd_sw "$SPID2")"); [ "$f2" = "-" ] && f2=$n2
   if [ "$S1_SPI" = "1" ]; then
-    cs17_lo; f1=$(sw_of "$(rd_sw "$SPID1")"); cs17_hi
+    f1=$(sw_of "$(rd_sw "$SPID1")")
     [ "$f1" = "-" ] && f1=$n1
-    pca_wr 0x01
   else
-    f1=$n1             # 孔1 读写都不通，状态只能记目标值
+    f1=$n1             # 孔1 未启用 SPI：状态只能记目标值
   fi
   echo "$f1 $f2 $f3" > $STATE
 
   # 计量沿用旧快照，不在控制路径里现读（现读要么假值要么被 RST 打断）
   ov3=$(old_meas 3); [ -n "$ov3" ] || ov3="||"
   ov2=$(old_meas 2); [ -n "$ov2" ] || ov2="||"
-  ov1="||"
+  ov1=$(old_meas 1); [ -n "$ov1" ] || ov1="||"
   printf '1|%s|%s\n2|%s|%s\n3|%s|%s\n' "$f1" "$ov1" "$f2" "$ov2" "$f3" "$ov3" > $SNAP
 
   iso_close
