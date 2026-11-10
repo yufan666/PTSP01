@@ -1,0 +1,4 @@
+# 设备端文件必须 LF（busybox ash 不认 CRLF）
+files/** text eol=lf
+files/** -text
+*.sh text eol=lf
