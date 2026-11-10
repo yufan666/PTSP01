@@ -68,10 +68,12 @@ jobs:
             gettext git libncurses-dev libssl-dev python3-distutils python3-setuptools \
             rsync unzip zlib1g-dev file wget ccache device-tree-compiler
 
+      # 源码一律从自己的 fork 拉取（上游 openwrt/openwrt 的镜像副本），
+      # 不依赖第三方仓库的可用性/变动，构建稳定可复现。
       - name: Clone OpenWrt ${{ inputs.openwrt_ref }}
         run: |
           git clone --depth 1 --branch "$OPENWRT_REF" \
-            https://github.com/openwrt/openwrt.git openwrt
+            https://github.com/yufan666/openwrt.git openwrt
           cd openwrt
           git log -1 --format='构建基线: %H  %s'
 
