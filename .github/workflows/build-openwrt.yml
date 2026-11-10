@@ -305,8 +305,11 @@ jobs:
             echo "::group::错误行检索"
             grep -n -iE "error|Error [0-9]|failed|No space|Killed|undefined reference" build.log | tail -n 60 || true
             echo "::endgroup::"
+            echo "::group::用 V=s 重跑 package/kernel/linux 取真实错误"
+            make package/kernel/linux/compile V=s -j1 2>&1 | tail -n 300 || true
+            echo "::endgroup::"
             echo "::group::用 V=s 重跑 target/linux install 取真实错误"
-            make target/linux/install V=s 2>&1 | tail -n 200 || true
+            make target/linux/install V=s 2>&1 | tail -n 120 || true
             echo "::endgroup::"
             echo "::group::磁盘 / 内存"
             df -h /

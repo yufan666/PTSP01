@@ -331,7 +331,8 @@ static int mbox_dma_map(struct ath79_pcm_rt_priv *rtpriv, dma_addr_t baseaddr,
 
 	rtpriv->elapsed_size = 0;
 	do {
-		desc = dma_pool_alloc(ath79_desc_pool, GFP_KERNEL, &desc_p);
+		/* called with ath79_mbox_lock held -> must not sleep */
+		desc = dma_pool_alloc(ath79_desc_pool, GFP_ATOMIC, &desc_p);
 		if (!desc) {
 			spin_unlock(&ath79_mbox_lock);
 			return -ENOMEM;
@@ -438,8 +439,8 @@ static irqreturn_t ath79_pcm_interrupt(int irq, void *dev_id)
 				snd_pcm_lib_period_bytes(priv->playback);
 			played_size = ath79_pcm_set_own_bits(rtpriv);
 			if (played_size > period_bytes)
-				snd_printd("Played more than one period: %d\n",
-					   played_size);
+				pr_debug("ath79-audio: played more than one period: %d\n",
+					 played_size);
 			rtpriv->elapsed_size += played_size;
 			mbox_interrupt_ack(
 				AR934X_DMA_MBOX_INT_STATUS_RX_DMA_COMPLETE);
@@ -448,7 +449,7 @@ static irqreturn_t ath79_pcm_interrupt(int irq, void *dev_id)
 				snd_pcm_period_elapsed(priv->playback);
 			}
 			if (!rtpriv->last_played)
-				snd_printd("ISR called but no played buf\n");
+				pr_debug("ath79-audio: ISR called but no played buf\n");
 		} else {
 			mbox_interrupt_ack(
 				AR934X_DMA_MBOX_INT_STATUS_RX_DMA_COMPLETE);
@@ -586,7 +587,7 @@ static int ath79_pcm_prepare(struct snd_soc_component *component,
 	cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 
 	/* first active stream resets the DMA MBOX controller */
-	if (cpu_dai->active == 1)
+	if (snd_soc_dai_active(cpu_dai) == 1)
 		mbox_dma_reset();
 
 	mbox_dma_prepare(rtpriv);
@@ -620,12 +621,12 @@ static snd_pcm_uframes_t ath79_pcm_pointer(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = ss->runtime;
 	struct ath79_pcm_rt_priv *rtpriv = runtime->private_data;
-	snd_pcm_uframes_t ret = 0;
+	unsigned int bytes = 0;
 
 	if (rtpriv->last_played)
-		ret = rtpriv->last_played->BufPtr - (u32)runtime->dma_addr;
+		bytes = rtpriv->last_played->BufPtr - (u32)runtime->dma_addr;
 
-	return bytes_to_frames(runtime, ret);
+	return bytes_to_frames(runtime, bytes);
 }
 
 /* ------------------------------------------------------------------ */
@@ -655,7 +656,8 @@ static const struct ath79_snd_clk_config clk_cfg[] = {
 static int ath79_i2s_startup(struct snd_pcm_substream *substream,
 			     struct snd_soc_dai *dai)
 {
-	if (!dai->active) {
+	/* 6.12: struct snd_soc_dai has no ->active member anymore */
+	if (!snd_soc_dai_active(dai)) {
 		stereo_wr(AR934X_STEREO_REG_CONFIG,
 			  AR934X_STEREO_CONFIG_SPDIF_ENABLE |
 			  AR934X_STEREO_CONFIG_I2S_ENABLE |
@@ -669,7 +671,8 @@ static int ath79_i2s_startup(struct snd_pcm_substream *substream,
 static void ath79_i2s_shutdown(struct snd_pcm_substream *substream,
 			       struct snd_soc_dai *dai)
 {
-	if (!dai->active)
+	/* last stream going down: the current one is still counted here */
+	if (snd_soc_dai_active(dai) <= 1)
 		stereo_wr(AR934X_STEREO_REG_CONFIG, 0);
 }
 

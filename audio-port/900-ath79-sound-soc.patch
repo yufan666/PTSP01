@@ -11,17 +11,17 @@ index e87bd15..8303793 100644
  source "sound/soc/au1x/Kconfig"
  source "sound/soc/bcm/Kconfig"
 diff --git a/sound/soc/Makefile b/sound/soc/Makefile
-index 775bb38..06af924 100644
+index 775bb38..3b5da17 100644
 --- a/sound/soc/Makefile
 +++ b/sound/soc/Makefile
-@@ -9,6 +9,7 @@ endif
- 
- ifneq ($(CONFIG_SND_SOC_TOPOLOGY_KUNIT_TEST),)
- # snd-soc-test-y := soc-topology-test.o
-+obj-$(CONFIG_SND_SOC_ATH79) += ath79/
- obj-$(CONFIG_SND_SOC_TOPOLOGY_KUNIT_TEST) += soc-topology-test.o
- endif
- 
+@@ -41,6 +41,7 @@ obj-$(CONFIG_SND_SOC)	+= generic/
+ obj-$(CONFIG_SND_SOC)	+= apple/
+ obj-$(CONFIG_SND_SOC)	+= adi/
+ obj-$(CONFIG_SND_SOC)	+= amd/
++obj-$(CONFIG_SND_SOC)	+= ath79/
+ obj-$(CONFIG_SND_SOC)	+= atmel/
+ obj-$(CONFIG_SND_SOC)	+= au1x/
+ obj-$(CONFIG_SND_SOC)	+= bcm/
 diff --git a/sound/soc/ath79/Kconfig b/sound/soc/ath79/Kconfig
 new file mode 100644
 index 0000000..dc6f096
@@ -52,10 +52,10 @@ index 0000000..7144ee7
 +snd-soc-ath79-objs := ath79-audio.o
 diff --git a/sound/soc/ath79/ath79-audio.c b/sound/soc/ath79/ath79-audio.c
 new file mode 100644
-index 0000000..2ab6403
+index 0000000..5600273
 --- /dev/null
 +++ b/sound/soc/ath79/ath79-audio.c
-@@ -0,0 +1,907 @@
+@@ -0,0 +1,910 @@
 +// SPDX-License-Identifier: GPL-2.0-only OR BSD-3-Clause
 +/*
 + * ath79-audio.c -- ASoC driver for the Atheros AR9331 I2S audio block
@@ -389,7 +389,8 @@ index 0000000..2ab6403
 +
 +	rtpriv->elapsed_size = 0;
 +	do {
-+		desc = dma_pool_alloc(ath79_desc_pool, GFP_KERNEL, &desc_p);
++		/* called with ath79_mbox_lock held -> must not sleep */
++		desc = dma_pool_alloc(ath79_desc_pool, GFP_ATOMIC, &desc_p);
 +		if (!desc) {
 +			spin_unlock(&ath79_mbox_lock);
 +			return -ENOMEM;
@@ -496,8 +497,8 @@ index 0000000..2ab6403
 +				snd_pcm_lib_period_bytes(priv->playback);
 +			played_size = ath79_pcm_set_own_bits(rtpriv);
 +			if (played_size > period_bytes)
-+				snd_printd("Played more than one period: %d\n",
-+					   played_size);
++				pr_debug("ath79-audio: played more than one period: %d\n",
++					 played_size);
 +			rtpriv->elapsed_size += played_size;
 +			mbox_interrupt_ack(
 +				AR934X_DMA_MBOX_INT_STATUS_RX_DMA_COMPLETE);
@@ -506,7 +507,7 @@ index 0000000..2ab6403
 +				snd_pcm_period_elapsed(priv->playback);
 +			}
 +			if (!rtpriv->last_played)
-+				snd_printd("ISR called but no played buf\n");
++				pr_debug("ath79-audio: ISR called but no played buf\n");
 +		} else {
 +			mbox_interrupt_ack(
 +				AR934X_DMA_MBOX_INT_STATUS_RX_DMA_COMPLETE);
@@ -644,7 +645,7 @@ index 0000000..2ab6403
 +	cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 +
 +	/* first active stream resets the DMA MBOX controller */
-+	if (cpu_dai->active == 1)
++	if (snd_soc_dai_active(cpu_dai) == 1)
 +		mbox_dma_reset();
 +
 +	mbox_dma_prepare(rtpriv);
@@ -678,12 +679,12 @@ index 0000000..2ab6403
 +{
 +	struct snd_pcm_runtime *runtime = ss->runtime;
 +	struct ath79_pcm_rt_priv *rtpriv = runtime->private_data;
-+	snd_pcm_uframes_t ret = 0;
++	unsigned int bytes = 0;
 +
 +	if (rtpriv->last_played)
-+		ret = rtpriv->last_played->BufPtr - (u32)runtime->dma_addr;
++		bytes = rtpriv->last_played->BufPtr - (u32)runtime->dma_addr;
 +
-+	return bytes_to_frames(runtime, ret);
++	return bytes_to_frames(runtime, bytes);
 +}
 +
 +/* ------------------------------------------------------------------ */
@@ -713,7 +714,8 @@ index 0000000..2ab6403
 +static int ath79_i2s_startup(struct snd_pcm_substream *substream,
 +			     struct snd_soc_dai *dai)
 +{
-+	if (!dai->active) {
++	/* 6.12: struct snd_soc_dai has no ->active member anymore */
++	if (!snd_soc_dai_active(dai)) {
 +		stereo_wr(AR934X_STEREO_REG_CONFIG,
 +			  AR934X_STEREO_CONFIG_SPDIF_ENABLE |
 +			  AR934X_STEREO_CONFIG_I2S_ENABLE |
@@ -727,7 +729,8 @@ index 0000000..2ab6403
 +static void ath79_i2s_shutdown(struct snd_pcm_substream *substream,
 +			       struct snd_soc_dai *dai)
 +{
-+	if (!dai->active)
++	/* last stream going down: the current one is still counted here */
++	if (snd_soc_dai_active(dai) <= 1)
 +		stereo_wr(AR934X_STEREO_REG_CONFIG, 0);
 +}
 +
