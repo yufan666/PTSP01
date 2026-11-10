@@ -164,6 +164,13 @@ jobs:
           grep -q '^CONFIG_DEVMEM=y$' "$KCFG" || { echo "!! target 未写入 DEVMEM=y"; exit 1; }
           echo "  ✓ DEVMEM=y 已写入 generic + target + 全部 subtarget"
 
+          # WM8988 依赖链自检（kernel-extra.config 第二段）
+          for sym in CONFIG_I2C CONFIG_SND_SOC CONFIG_SND_SOC_WM8988; do
+            grep -q "^${sym}=m$" "$GENC" || { echo "!! generic 未写入 ${sym}=m"; exit 1; }
+            grep -q "^${sym}=m$" "$KCFG" || { echo "!! target 未写入 ${sym}=m"; exit 1; }
+          done
+          echo "  ✓ I2C/SND_SOC/WM8988=m 已写入 generic + target + 全部 subtarget"
+
           echo "===== 4/5 打包进镜像的文件 ====="
           mkdir -p files
           if [ -d ../files ]; then
