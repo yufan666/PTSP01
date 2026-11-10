@@ -579,7 +579,6 @@ static int ath79_pcm_hw_free(struct snd_soc_component *component,
 static int ath79_pcm_prepare(struct snd_soc_component *component,
 			     struct snd_pcm_substream *ss)
 {
-	struct ath79_audio_priv *priv = snd_soc_component_get_drvdata(component);
 	struct ath79_pcm_rt_priv *rtpriv = ss->runtime->private_data;
 	struct snd_soc_pcm_runtime *rtd = ss->private_data;
 	struct snd_soc_dai *cpu_dai;
