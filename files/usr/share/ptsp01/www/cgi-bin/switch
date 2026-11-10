@@ -1,0 +1,31 @@
+#!/bin/sh
+# switch —— GET /cgi-bin/switch?id=1|2|3|all&state=0|1|toggle
+# 控制继电器。编排逻辑统一在 pl7223.sh 的 do_switch（完整唤醒协议）。
+
+printf 'Content-Type: application/json\r\n\r\n'
+
+. /usr/lib/ptsp01/pl7223.sh
+
+qs_get() { echo "$QUERY_STRING" | tr '&' '\n' | grep "^$1=" | cut -d= -f2- | head -1; }
+
+ID=$(qs_get id)
+ST=$(qs_get state)
+
+case "$ID" in 1|2|3|all) ;; *) echo '{"ok":false,"err":"bad id"}'; exit 0;; esac
+case "$ST" in 0|1|toggle) ;; *) echo '{"ok":false,"err":"bad state"}'; exit 0;; esac
+
+if [ "$ST" = "toggle" ]; then
+  ensure_state
+  read s1 s2 s3 < $STATE
+  case "$ID" in
+    1) ST=$(( 1 - s1 ));;
+    2) ST=$(( 1 - s2 ));;
+    3) ST=$(( 1 - s3 ));;
+    all) ST=$(( 1 - s1 ));;
+  esac
+fi
+
+R=$(do_switch "$ID" "$ST") || { echo '{"ok":false,"err":"busy"}'; exit 0; }
+f1=${R%% *}; rest=${R#* }; f2=${rest%% *}; f3=${rest#* }
+
+echo '{"ok":true,"readback":['"$f1,$f2,$f3"'],"states":{"1":'$f1',"2":'$f2',"3":'$f3'}}'

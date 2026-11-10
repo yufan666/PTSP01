@@ -1,0 +1,25 @@
+#!/bin/sh
+# status —— GET /cgi-bin/status
+# 输出三孔 开关状态 + 电压/电流/功率 JSON
+# 编排逻辑统一在 /usr/lib/ptsp01/pl7223.sh 的 read_all_raw（免唤醒优先）
+
+printf 'Content-Type: application/json\r\n\r\n'
+
+. /usr/lib/ptsp01/pl7223.sh
+
+JSON=$(read_all_raw | awk -F'|' '
+  BEGIN { total = 0; out = "" }
+  {
+    on  = ($2 == "1") ? "true" : "false"
+    err = ($3 == "") ? "true" : "false"
+    v = ($3 == "") ? "null" : $3
+    a = ($4 == "") ? "null" : $4
+    w = ($5 == "") ? "null" : $5
+    seg = sprintf("{\"id\":%s,\"on\":%s,\"err\":%s,\"v\":%s,\"a\":%s,\"w\":%s}", $1, on, err, v, a, w)
+    out = out (NR > 1 ? "," : "") seg
+    if ($3 != "") total += $5
+  }
+  END { printf "[%s]|%.2f", out, total }
+')
+
+echo '{"ok":true,"sockets":'"${JSON%%|*}"',"total_w":'${JSON##*|}'}'

@@ -1,0 +1,14 @@
+#!/bin/sh
+# 首次启动生成 MQTT 配置骨架（server 必须改为实际 MQTT broker 地址）
+
+[ -f /etc/config/ptsp01 ] || cat > /etc/config/ptsp01 << 'EOF'
+config main 'main'
+	option server ''
+	option port '1883'
+	option base 'ptsp01'
+	option interval '60'
+	option username ''
+	option password ''
+EOF
+
+exit 0

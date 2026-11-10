@@ -1,0 +1,23 @@
+#!/bin/sh /etc/rc.common
+# ptsp01-mqtt —— MQTT 接入守护（Home Assistant 自动发现）
+# 依赖 mosquitto-client-nossl 包与 /etc/config/ptsp01 的 main.server 配置
+
+START=96
+USE_PROCD=1
+
+start_service() {
+    command -v mosquitto_pub >/dev/null 2>&1 || {
+        echo "mosquitto-client 未安装，跳过 MQTT"; return 1
+    }
+    local server
+    server=$(uci -q get ptsp01.main.server)
+    [ -z "$server" ] && {
+        echo "未配置 ptsp01.main.server（MQTT broker 地址），跳过 MQTT"; return 1
+    }
+    procd_open_instance
+    procd_set_param command /bin/sh /usr/bin/ptsp01-mqtt.sh
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}
