@@ -17,26 +17,12 @@ case "$QUERY_STRING" in
   *)        DATA=$(cat $SNAP 2>/dev/null) ;;
 esac
 
-# 快照缺失（刚开机）→ 真读一次并落盘
+# 快照缺失（刚开机 / 首次访问）→ 真读一次并落盘。
+# ⚠ 这里会打一次 RST：芯片只有 RST 后才返回真实计量值。RST 会把三孔继电器
+#   复位为闭合，read_all_raw 内部会按状态文件立刻把该关的关掉。
+#   所以这条路径只在快照为空时走一次，日常轮询都读快照，不会反复断电。
 if [ -z "$DATA" ]; then
   DATA=$(read_all_raw)
-fi
-
-# 快照里一孔计量都没有 → 免唤醒补读一次自愈。
-# 典型成因：旧版 do_switch 只把开关写进快照、计量留空，之后网页一直读这个脏快照。
-# 两个保险：① 30 秒内最多试一次，避免和网页轮询打架；② 置 PTSP01_NO_WAKE=1，
-# 保证这条路径只做免唤醒读取，probe 不通就放弃 —— 绝不会打 RST 把继电器断掉。
-has_v=$(printf '%s\n' "$DATA" | awk -F'|' '$3 != "" { f = 1 } END { print f + 0 }')
-if [ "$has_v" = "0" ]; then
-  now=$(cut -d. -f1 /proc/uptime 2>/dev/null); now=${now:-0}
-  try=$(cat /tmp/snap_try 2>/dev/null); try=${try:-0}
-  if [ $((now - try)) -ge 30 ]; then
-    echo "$now" > /tmp/snap_try
-    NEW=$(PTSP01_NO_WAKE=1 read_all_raw)
-    if printf '%s\n' "$NEW" | awk -F'|' '$3 != "" { f = 1 } END { exit !f }'; then
-      DATA=$NEW
-    fi
-  fi
 fi
 
 [ -n "$DATA" ] || DATA=$(printf '1|||\n2|||\n3|||')

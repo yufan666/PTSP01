@@ -140,7 +140,11 @@ rd_mode3() {   # $1=dev $2=cmd（如 w70,00）
 
 wr_sw() {   # $1=dev $2=0|1
   d=00; [ "$2" = "1" ] && d=20
-  spi_rx "$1" wB8,0F,$d r1 > /dev/null
+  # ⚠ 末尾绝对不能带 r1！写事务后面再挂一个读阶段，会把刚写进去的值冲掉：
+  #   实测「wB8,0F,20 r1」写完回读恒为 00，继电器真的断开；
+  #   去掉 r1 后回读稳定为 20/00，开关才真正生效。
+  #   这是「网页点开关没反应、电压一直是 0」的真正元凶（2026-11-10）。
+  spitest "$1" 125000 "wB8,0F,$d" > /dev/null 2>&1
 }
 
 # 按状态文件重写三孔（唤醒后必调）；顺序 孔3→孔2→孔1（GPIO17 窗口最短）
@@ -170,7 +174,7 @@ conv() {
     { gsub(/[ \t\r\n]/, ""); h = tolower($0) }
     END {
       L = length(h)
-      if (L != 12) { print "0.0000"; exit }     # 不是 6 字节 = 读取失败
+      if (L != 12 && L != 8) { print "0.0000"; exit }   # 只接受 6 字节 / 4 字节
       n = 0
       for (i = L - 2; i >= 0; i -= 2) {         # 从末字节（MSB）开始往前
         d1 = index("0123456789abcdef", substr(h, i + 1, 1)) - 1
@@ -191,7 +195,17 @@ in_range() { awk -v x="$1" -v hi="$2" 'BEGIN { exit !(x + 0 >= 0 && x + 0 <= hi)
 calc3() {   # $1=电压原始 $2=电流原始 $3=功率原始
   if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then printf '||\n'; return; fi
   v=$(conv "$1" 22); a=$(conv "$2" 24); w=$(conv "$3" 24)
-  if in_range "$v" 400 && in_range "$a" 100 && in_range "$w" 22000; then
+  # 超量程时改用「低 4 字节」重算：实测 6 字节读的第 5/6 字节经常是读残渣
+  # （例如电流读出 200000008000，第 5 字节 0x80 把它顶成 10^12 级），
+  # 而低 4 字节是干净的。小端串的低 4 字节就是前 8 个字符。
+  if ! ( in_range "$v" 400 && in_range "$a" 100 && in_range "$w" 22000 ); then
+    v=$(conv "${1%????}" 22); a=$(conv "${2%????}" 24); w=$(conv "${3%????}" 24)
+  fi
+  ok=1
+  in_range "$v" 400 || ok=0
+  in_range "$a" 100 || ok=0
+  in_range "$w" 22000 || ok=0
+  if [ "$ok" = "1" ]; then
     printf '%s|%s|%s\n' "$v" "$a" "$w"
   else
     printf '||\n'
@@ -205,16 +219,32 @@ spid_of() { case "$1" in 1) echo $SPID1;; 2) echo $SPID2;; 3) echo $SPID3;; esac
 # 调用方负责持锁与 iso（P0）状态；孔1 的 CS 窗口在本函数内部自管。
 measure1() {   # $1=孔号
   d=$(spid_of "$1")
-  pca_wr 0x01        # 每孔重新使能隔离：连续多轮事务后 P0 会掉，掉了就读回全 0
   [ "$1" = "1" ] && cs17_lo
-  uv=$(rd_mode3 "$d" "w70,00"); iv=$(rd_mode3 "$d" "w70,06"); pv=$(rd_mode3 "$d" "w70,78")
+  calc3 "$(rd_u "$d")" "$(rd_i "$d")" "$(rd_p "$d")"
   [ "$1" = "1" ] && cs17_hi
-  calc3 "$uv" "$iv" "$pv"
+}
+
+# 一个完整的「RST + 读某孔计量」：这是唯一能拿到真实 V/A/W 的路径。
+# ⚠ 读之前**不要**写 0x380F —— 写事务会把计量寄存器打成 0.8A/16W 这种假值
+#   （实测：只 RST 读到 I≈0/P=1.8W；RST 后再写一次 0x380F 就变成 I=0.8A/P=16W）。
+#   所以调用方必须「先读、读完再 rewrite_states 恢复开关状态」。
+read_one() {   # $1=孔号
+  wake_all
+  pca_wr 0x01
+  measure1 "$1"
 }
 
 # 从旧快照里取某孔的计量列（"v|a|w"，没有则 "||"）
 old_meas() {   # $1=孔号
   awk -F'|' -v n="$1" '$1 == n { printf "%s|%s|%s\n", $3, $4, $5 }' $SNAP 2>/dev/null
+}
+
+# 0x380F 回读值 → 0/1；读不到返回 "-"
+sw_of() {
+  case "$1" in
+    ""|*[!0-9A-Fa-f]*) echo "-"; return ;;
+  esac
+  [ $(( 0x$1 & 0x20 )) -ne 0 ] && echo 1 || echo 0
 }
 
 # ---------- 上层编排（网页 CGI / MQTT 守护共用，单一事实来源） ----------
@@ -234,64 +264,30 @@ read_all_raw() {
   btn_lock_take
   prep_env
 
-  probe_id() {   # $1=孔号 → ID 字节（孔1 事务须手动包 GPIO17）
-    dev=$(spid_of "$1")
-    [ "$1" = "1" ] && cs17_lo
-    r=$(rd_id "$dev")
-    [ "$1" = "1" ] && cs17_hi
-    echo "$r"
-  }
-
-  reachable=1
-  iso_open
-  # probe 顺序 3→2→1：GPIO17 窗口最后开（见 do_switch 同理）
-  for n in 3 2 1; do
-    [ "$n" = "1" ] && [ "$S1_SPI" != "1" ] && continue
-    [ "$(probe_id $n)" = "04" ] || reachable=0
-  done
-
-  if [ "$reachable" = "0" ] || [ -f /tmp/ptsp01_wake_always ]; then
-    # 免唤醒模式（PTSP01_NO_WAKE=1）：probe 不通就直接放弃，绝不打 RST 脉冲。
-    # RST 会把三颗 PL7223 的 0x380F 复位为 00 = 三个继电器全断开，等于远程断电。
-    # 供 status 的脏快照自愈使用：宁可这一轮没有数据，也不能把用户的设备断电。
-    if [ "$PTSP01_NO_WAKE" = "1" ] && [ ! -f /tmp/ptsp01_wake_always ]; then
-      printf '1|||\n2|||\n3|||\n' >&3
-      iso_close
-      btn_lock_free
-      web_lock_free
-      exec 3>&-
-      return
-    fi
-    wake_all
-    rewrite_states
-    pca_wr 0x01     # 重开 P0=1（孔1 窗口可能已把它带掉）
-  fi
+  # 真实开关状态以状态文件为准：0x380F 写不进"开"（回读恒 00），只能当断开用。
+  read s1 s2 s3 < $STATE 2>/dev/null
+  [ -n "$s1" ] || s1=0; [ -n "$s2" ] || s2=0; [ -n "$s3" ] || s3=0
 
   o1=""; o2=""; o3=""
-  for n in 3 2 1; do          # 读顺序同为 3→2→1，输出仍按 1/2/3 归位
+  # ⚠ 每个孔都必须单独 RST 一次 —— 这是最反直觉但实测唯一有效的做法：
+  #   芯片在一次 SPI 事务（CS 拉高）后就进待机，0x3000/0x3006/0x3078 立刻读回 0
+  #   或浮空噪声。所以「RST 一次连读三孔」只有第一孔是真的，后面两孔全是假的
+  #   （网页上"空载却有 0.8A/16W"就是这么来的）。
+  #   代价：live 读要 3 次 RST（约 7 秒），期间三个继电器都会闭合一下，
+  #   读完立刻 rewrite_states 恢复目标状态。
+  for n in 3 2 1; do
     if [ "$n" = "1" ] && [ "$S1_SPI" != "1" ]; then
-      o1="1|||"               # 孔1 本版不参与 SPI，按"未知"上报
+      o1="1|$s1|||"   # 孔1 本版不参与 SPI：开关态照状态文件，计量未知
       continue
     fi
     dev=$(spid_of "$n")
-    [ "$n" = "1" ] && cs17_lo
-    sw=$(rd_sw "$dev")
-    uv=$(rd_mode3 "$dev" "w70,00"); iv=$(rd_mode3 "$dev" "w70,06"); pv=$(rd_mode3 "$dev" "w70,78")
-    [ "$n" = "1" ] && cs17_hi
-
-    on=""
-    if [ -n "$sw" ]; then
-      case "$sw" in
-        *[!0-9A-Fa-f]*) ;;                        # 非纯十六进制 → 视为通信失败
-        *) [ $(( 0x$sw & 0x20 )) -ne 0 ] && on=1 || on=0 ;;
-      esac
-    fi
-    v=""; a=""; w=""
-    mw=$(calc3 "$uv" "$iv" "$pv")     # 换算 + 量程检查（超量程则整孔作废）
+    mw=$(read_one "$n")
+    case "$n" in 1) on=$s1;; 2) on=$s2;; 3) on=$s3;; esac
     v=${mw%%|*}; rest=${mw#*|}; a=${rest%%|*}; w=${rest#*|}
     line="$n|$on|$v|$a|$w"
     case "$n" in 1) o1=$line;; 2) o2=$line;; 3) o3=$line;; esac
   done
+  rewrite_states        # 读完把该关的孔关回去（RST 会把它们全开）
   printf '%s\n%s\n%s\n' "$o1" "$o2" "$o3" > $SNAP
   printf '%s\n%s\n%s\n' "$o1" "$o2" "$o3" >&3
 
@@ -323,75 +319,31 @@ do_switch() {
     all) n1=$ST; n2=$ST; n3=$ST;;
   esac
 
-  # —— 能不能不打 RST 就写？——
-  # wake_all 会把三颗 PL7223 的 0x380F 全复位为 OFF，而孔1 在 S1_SPI=0 时
-  # 无法重写（CS 与 i2c SDA 共线），于是"点一次孔2 的开关 = 给孔1 断一次电"。
-  # 所以先 probe：芯片本来就醒着（ID=04）就直接写，节省 2 秒且不动孔1。
-  iso_open
-  reach=1
-  [ "$(rd_id "$SPID3")" = "04" ] || reach=0
-  [ "$(rd_id "$SPID2")" = "04" ] || reach=0
-  if [ "$S1_SPI" = "1" ]; then
-    cs17_lo; [ "$(rd_id "$SPID1")" = "04" ] || reach=0; cs17_hi
-    pca_wr 0x01        # 孔1 窗口用了 SDA，P0 隔离使能要重开
-  fi
-
-  if [ "$reach" = "0" ]; then
-    wake_all
-    echo "0 0 0" > $STATE     # 唤醒后三孔真实状态全 OFF
-  fi
-  cs17_hi
-  wr_sw "$SPID3" "$n3"
-  wr_sw "$SPID2" "$n2"
-  if [ "$S1_SPI" = "1" ]; then
-    cs17_lo; wr_sw "$SPID1" "$n1"; cs17_hi
-    pca_wr 0x01     # 孔1 窗口用掉了 SDA，P0 隔离使能可能已丢，必须重开再做回读
-  fi
-
-  # 回读：孔3/孔2 在前，孔1 最后。
-  # ⚠ GPIO17 拉低期间 i2c（SDA）不可用，而 PCA P0=隔离使能要靠 i2c 维持；
-  #   所以孔1 的窗口必须最后开，开完立刻恢复，否则后面的孔全部读不到。
-  r3v=$(rd_sw "$SPID3")
-  r2v=$(rd_sw "$SPID2")
-  if [ "$S1_SPI" = "1" ]; then
-    cs17_lo; r1v=$(rd_sw "$SPID1"); cs17_hi
-    pca_wr 0x01
-  else
-    r1v=""
-  fi
-  sw_of() {
-    case "$1" in
-      ""|*[!0-9A-Fa-f]*) echo "-"; return ;;
-    esac
-    [ $(( 0x$1 & 0x20 )) -ne 0 ] && echo 1 || echo 0
-  }
-  f1=$(sw_of "$r1v")
-  if [ "$S1_SPI" != "1" ]; then
-    # 孔1 不参与 SPI：唤醒过的这一轮它真的被复位成 OFF 了，不能沿用 STATE 谎报"开"；
-    # 没唤醒则保持原状态，沿用旧值。
-    if [ "$reach" = "0" ]; then f1=0; else f1=$n1; fi
-  fi
-  [ "$f1" = "-" ] && f1=$n1
-  f2=$(sw_of "$r2v"); f3=$(sw_of "$r3v")
-  [ "$f2" = "-" ] && f2=$n2
-  [ "$f3" = "-" ] && f3=$n3
-  echo "$f1 $f2 $f3" > $STATE
-  # 快照必须带计量，不能只写开关。
-  # 网页默认只读快照（不碰 SPI），如果这里把 V/A/W 留空，用户点一次开关后
-  # 三孔计量就会一直显示 "--"，而 status 读到的快照非空又不会自愈 —— 现象就是
-  # "点完开关，电压电流功率全没了"（2026-11-10 真机 bug）。
-  # 此刻芯片已被唤醒、P0 隔离已开，顺手补读几组事务即可，不必再打一次 RST。
-  ov3=$(measure1 3)
-  ov2=$(measure1 2)
-  [ "$ov3" = "||" ] && ov3=$(old_meas 3)   # 现读失败就沿用旧值，绝不写空
-  [ "$ov2" = "||" ] && ov2=$(old_meas 2)
-  [ -n "$ov3" ] || ov3="||"
-  [ -n "$ov2" ] || ov2="||"
+  # —— 继电器语义（wr_sw 去掉 r1 后已能正常写入）——
+  # RST 会把三孔复位为 ON（回读 20），所以流程固定为：
+  #   落盘目标状态 → 逐孔 RST 读计量（此时全开，读数干净）→ 按目标状态重写三孔 → 回读
+  echo "$n1 $n2 $n3" > $STATE
+  ov3=$(read_one 3)
+  ov2=$(read_one 2)
   ov1="||"
   if [ "$S1_SPI" = "1" ]; then
-    ov1=$(measure1 1)
-    pca_wr 0x01        # 孔1 窗口占用了 SDA，P0 需重开
+    ov1=$(read_one 1)
   fi
+  rewrite_states        # 读完了，按目标状态把该关的关回去
+  cs17_hi
+  pca_wr 0x01
+
+  # 回读校验（写入已修复，回读值可信）
+  f3=$(sw_of "$(rd_sw "$SPID3")"); [ "$f3" = "-" ] && f3=$n3
+  f2=$(sw_of "$(rd_sw "$SPID2")"); [ "$f2" = "-" ] && f2=$n2
+  if [ "$S1_SPI" = "1" ]; then
+    cs17_lo; f1=$(sw_of "$(rd_sw "$SPID1")"); cs17_hi
+    [ "$f1" = "-" ] && f1=$n1
+    pca_wr 0x01
+  else
+    f1=$n1             # 孔1 读写都不通，状态只能记目标值
+  fi
+  echo "$f1 $f2 $f3" > $STATE
   printf '1|%s|%s\n2|%s|%s\n3|%s|%s\n' "$f1" "$ov1" "$f2" "$ov2" "$f3" "$ov3" > $SNAP
 
   iso_close
